@@ -272,8 +272,6 @@ The product captures three data points over time:
 
 With 3-5 years of this data across thousands of loans, regression analysis can identify which factors actually predict defaults and at what weights. The default weights get replaced by data-driven ones.
 
-This is how FICO was built. Fair Isaac started with expert hypotheses about what mattered, collected outcome data across millions of loans, and refined weights through statistical analysis of actual defaults over decades. SteadView builds the data collection infrastructure for that same journey, specific to non-traditional income.
-
 ```
 Tool Score: 62         Evaluator Score: 55        Decision: Refer
                               |
