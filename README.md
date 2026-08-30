@@ -1,8 +1,7 @@
 # SteadView
 Improve loan approval rates for gig workers by making underwriting faster. 
-
+### Test samples: https://github.com/hsgarg/SteadView/tree/main/test-data
 ---
-
 ## Why This Product Exists
 
 ### The Job to Be Done
