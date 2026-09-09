@@ -299,7 +299,6 @@ Tool Score: 62         Evaluator Score: 55        Decision: Refer
 
 6. **Forward-looking limitations.** Historical recurrence does not guarantee future continuation. The tool cannot assess whether contracts are ongoing or relationships are stable.
 
-Some of these limitations were informed by discussions with Professor Beatrice Michaeli (UCLA Anderson School of Management, Ph.D. Columbia Business School), whose research focuses on financial reporting, disclosure, and performance measurement.
 
 ---
 
