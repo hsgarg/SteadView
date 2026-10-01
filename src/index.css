@@ -1,0 +1,188 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&display=swap');
+@import 'tailwindcss';
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: #070c19;
+}
+
+@theme inline {
+  --color-background: #070c19;
+  --color-surface: #0d1526;
+  --color-card: #111d33;
+  --color-border: rgba(99, 132, 190, 0.15);
+  --color-border-strong: rgba(99, 132, 190, 0.28);
+  --color-primary: #3b82f6;
+  --color-primary-dim: rgba(59, 130, 246, 0.15);
+  --color-teal: #14b8a6;
+  --color-teal-dim: rgba(20, 184, 166, 0.15);
+  --color-amber: #f59e0b;
+  --color-amber-dim: rgba(245, 158, 11, 0.15);
+  --color-red: #ef4444;
+  --color-red-dim: rgba(239, 68, 68, 0.12);
+  --color-emerald: #10b981;
+  --color-emerald-dim: rgba(16, 185, 129, 0.12);
+  --color-text-primary: #e2e8f0;
+  --color-text-secondary: #94a3b8;
+  --color-text-muted: #4b6a8a;
+
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: 'DM Mono', 'Courier New', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  color: #e2e8f0;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(99, 132, 190, 0.2);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(99, 132, 190, 0.4);
+}
+
+.mono {
+  font-family: 'DM Mono', monospace;
+}
+
+.badge-approved {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.badge-conditional {
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.badge-declined {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.badge-review {
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.section-card {
+  background: #0d1526;
+  border: 1px solid rgba(99, 132, 190, 0.15);
+}
+
+.metric-card {
+  background: #111d33;
+  border: 1px solid rgba(99, 132, 190, 0.15);
+  transition: border-color 0.15s ease;
+}
+
+.metric-card:hover {
+  border-color: rgba(99, 132, 190, 0.3);
+}
+
+.input-field {
+  background: #111d33;
+  border: 1px solid rgba(99, 132, 190, 0.2);
+  color: #e2e8f0;
+  font-family: 'Inter', sans-serif;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.input-field:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+
+.input-field::placeholder {
+  color: #4b6a8a;
+}
+
+.upload-zone {
+  border: 1.5px dashed rgba(99, 132, 190, 0.25);
+  background: rgba(13, 21, 38, 0.6);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.upload-zone:hover,
+.upload-zone.dragover {
+  border-color: rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.expandable-header {
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.expandable-header:hover {
+  background: rgba(99, 132, 190, 0.05);
+}
+
+.score-ring {
+  transform: rotate(-90deg);
+}
+
+.stability-A { color: #10b981; }
+.stability-B { color: #3b82f6; }
+.stability-C { color: #f59e0b; }
+.stability-D { color: #ef4444; }
+
+.grade-bg-A { background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); color: #10b981; }
+.grade-bg-B { background: rgba(59, 130, 246, 0.12); border: 1px solid rgba(59, 130, 246, 0.3); color: #3b82f6; }
+.grade-bg-C { background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.3); color: #f59e0b; }
+.grade-bg-D { background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.3); color: #ef4444; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-in {
+  animation: fadeIn 0.3s ease forwards;
+}
+
+@keyframes pulse-blue {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  15%       { transform: translateX(-5px); }
+  35%       { transform: translateX(5px); }
+  55%       { transform: translateX(-4px); }
+  75%       { transform: translateX(4px); }
+  90%       { transform: translateX(-2px); }
+}
+
+.shake {
+  animation: shake 0.55s ease;
+}
+
+.processing-dot {
+  animation: pulse-blue 1.4s ease-in-out infinite;
+}
+
+.processing-dot:nth-child(2) { animation-delay: 0.2s; }
+.processing-dot:nth-child(3) { animation-delay: 0.4s; }

@@ -1,0 +1,806 @@
+{
+  "name": "IncomeFlowAnalyser",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "steadview",
+        "responseMode": "responseNode",
+        "options": {
+          "binaryPropertyName": "files"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1232,
+        448
+      ],
+      "id": "a12a7c1c-778d-4400-aca1-8f7185fbd8be",
+      "name": "Webhook",
+      "webhookId": "e7ae3a8e-9b89-4edd-b54a-d8f5a804674c"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.documentType }}",
+                    "rightValue": "=BANK_STATEMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "c8571a3e-a2b6-485f-8935-0ad2c8eba225"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        208,
+        416
+      ],
+      "id": "6aa2424f-eb20-4748-b546-d7f581829bb9",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (items.length === 0) {\n  throw new Error(\"No bank statements found.\");\n}\n\nconst DAY_MS = 24 * 60 * 60 * 1000;\n\nconst normalize = (s) =>\n  (s || \"\")\n    .trim()\n    .toLowerCase()\n    .replace(/\\s+/g, \" \");\n\nconst addDays = (date, days) => {\n  const d = new Date(date);\n  d.setDate(d.getDate() + days);\n  return d;\n};\n\nconst diffDays = (start, end) =>\n  Math.floor((end - start) / DAY_MS) + 1;\n\n// --------------------------------------------------\n// 1. Validate account holder\n// --------------------------------------------------\n\nconst expectedHolder = normalize(items[0].json.account.accountHolder);\n\nfor (const item of items) {\n  const holder = normalize(item.json.account.accountHolder);\n\n  if (holder !== expectedHolder) {\n    throw new Error(\n      `Account holder mismatch. Expected '${items[0].json.account.accountHolder}' but found '${item.json.account.accountHolder}'.`\n    );\n  }\n}\n\n// --------------------------------------------------\n// 2. Sort statements chronologically\n// --------------------------------------------------\n\nitems.sort(\n  (a, b) =>\n    new Date(a.json.account.statementStartDate) -\n    new Date(b.json.account.statementStartDate)\n);\n\n// --------------------------------------------------\n// 3. Validate continuous coverage\n// --------------------------------------------------\n\nlet coverageStart = new Date(items[0].json.account.statementStartDate);\nlet coverageEnd = new Date(items[0].json.account.statementEndDate);\n\nlet hasGap = false;\nlet gapReason = \"\";\n\nfor (let i = 1; i < items.length; i++) {\n  const currentStart = new Date(items[i].json.account.statementStartDate);\n  const currentEnd = new Date(items[i].json.account.statementEndDate);\n\n  const expectedStart = addDays(coverageEnd, 1);\n\n  if (currentStart.getTime() !== expectedStart.getTime()) {\n    hasGap = true;\n    gapReason = `Gap detected between ${coverageEnd.toISOString().slice(0,10)} and ${currentStart.toISOString().slice(0,10)}`;\n    break;\n  }\n\n  if (currentEnd > coverageEnd) {\n    coverageEnd = currentEnd;\n  }\n}\n\nconst coverageDays = diffDays(coverageStart, coverageEnd);\n\n// --------------------------------------------------\n// 4. Validate recency\n// --------------------------------------------------\n\nconst today = new Date();\nconst daysSinceLatestStatement = Math.floor(\n  (today - coverageEnd) / DAY_MS\n);\n\n// --------------------------------------------------\n// 5. Final result\n// --------------------------------------------------\n\nreturn [\n  {\n    json: {\n      isValid:\n        !hasGap &&\n        coverageDays >= 90 &&\n        daysSinceLatestStatement <= 120,\n\n      accountHolder: items[0].json.account.accountHolder,\n\n      coverageStart: coverageStart.toISOString().slice(0, 10),\n      coverageEnd: coverageEnd.toISOString().slice(0, 10),\n\n      coverageDays,\n      daysSinceLatestStatement,\n\n      hasGap,\n      gapReason,\n\n      withinLast120Days: daysSinceLatestStatement <= 120\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1472,
+        976
+      ],
+      "id": "c2cd75af-9ea7-40a1-930c-84f76368727d",
+      "name": "checks90DayCoverage",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// FILTER & CLASSIFY TRANSACTIONS — Income + Expenses\n// ============================================================\n// Replaces the V1 \"filterIncomeStreams\" node.\n// \n// V1 only kept CREDIT transactions in income categories.\n// V2 keeps BOTH sides — income AND expenses — and classifies\n// each expense into FIXED / ESSENTIAL / DISCRETIONARY / DEBT /\n// SAVINGS / INVESTIGATE / EXCLUDE.\n//\n// INTERNAL_TRANSFER and REFUND are excluded from both sides —\n// they're not real income or real expenses.\n// ============================================================\n\n\n// ===================\n// CATEGORY DEFINITIONS\n// ===================\n\n// Income categories (same as V1)\nconst incomeCategories = new Set([\n  \"SALARY\",\n  \"GIG_INCOME\",\n  \"FREELANCE_INCOME\",\n  \"PENSION\",\n  \"RENTAL_INCOME\",\n  \"INTEREST\",\n  \"DIVIDEND\",\n  \"BUSINESS_INCOME\"\n]);\n\n// Expense categories → mapped to obligation type\n// FIXED:         Non-negotiable. Borrower can't reduce these.\n// ESSENTIAL:     Necessary but has some flex (cheaper groceries, less fuel).\n// DISCRETIONARY: Can be cut entirely if needed.\n// DEBT:          Existing loan obligations — drives DTI calculation.\n// SAVINGS:       Investment/savings — positive signal, not a \"cost.\"\n// INVESTIGATE:   Can't classify without more info (cash, generic transfers).\n// EXCLUDE:       Not a real expense (internal transfers, refunds).\nconst expenseTypeMap = {\n  // FIXED — non-negotiable obligations\n  \"RENT\":           \"FIXED\",\n  \"MORTGAGE\":       \"FIXED\",\n  \"UTILITIES\":      \"FIXED\",\n  \"BILL_PAYMENT\":   \"FIXED\",\n  \"INSURANCE\":      \"FIXED\",\n  \"TAX\":            \"FIXED\",\n  \"FEES\":           \"FIXED\",\n\n  // DEBT — existing loan obligations (subset of fixed, but tracked separately for DTI)\n  \"LOAN_PAYMENT\":   \"DEBT\",\n\n  // ESSENTIAL — necessary, some flexibility\n  \"GROCERIES\":      \"ESSENTIAL\",\n  \"TRANSPORT\":      \"ESSENTIAL\",\n  \"FUEL\":           \"ESSENTIAL\",\n  \"HEALTHCARE\":     \"ESSENTIAL\",\n  \"EDUCATION\":      \"ESSENTIAL\",\n\n  // DISCRETIONARY — can be cut\n  \"DINING\":         \"DISCRETIONARY\",\n  \"SHOPPING\":       \"DISCRETIONARY\",\n  \"ENTERTAINMENT\":  \"DISCRETIONARY\",\n  \"SUBSCRIPTION\":   \"DISCRETIONARY\",\n  \"CHARITY\":        \"DISCRETIONARY\",\n  \"TRAVEL\":         \"DISCRETIONARY\",\n  \"OTHER\":          \"DISCRETIONARY\",\n\n  // SAVINGS — positive signal, not an expense\n  \"INVESTMENT\":     \"SAVINGS\",\n\n};\nconst routeType = {\n   // INVESTIGATE — can't classify further\n  \"CASH_WITHDRAWAL\":\"INVESTIGATE\",\n  \"ATM\":            \"INVESTIGATE\",\n  \"TRANSFER\":       \"INVESTIGATE\",\n\n  // EXCLUDE — not real transactions for analysis\n  \"INTERNAL_TRANSFER\": \"INVESTIGATE\",\n  \"REFUND\":            \"INVESTIGATE\",\n  \"CASH_DEPOSIT\":      \"INVESTIGATE\"\n}\n// Categories that should be excluded regardless of direction\nconst EXCLUDE_CATEGORIES = new Set([\n  \"INTERNAL_TRANSFER\",\n  \"REFUND\"\n]);\n\n\n// ===================\n// PROCESS TRANSACTIONS\n// ===================\n\nconst output = [];\n\nfor (const item of $input.all()) {\n  const transactions = item.json.transactions || [];\n\n  const incomeTransactions = [];\n  const expenseTransactions = [];\n  const excludedTransactions = [];\n  const investigateTransactions = [];\n  const savingsTransactions = [];\n\n  for (const tx of transactions) {\n    const category = tx.transactionCategory;\n    const direction = tx.direction;\n\n    // -------------------------------------------------------\n    // STEP 1: Exclude non-real transactions (both directions)\n    // -------------------------------------------------------\n    /*if (EXCLUDE_CATEGORIES.has(category)) {\n      excludedTransactions.push({ ...tx, expenseType: \"EXCLUDE\" });\n      continue;\n    }*/\n\n    // -------------------------------------------------------\n    // STEP 2: Process CREDIT transactions\n    // -------------------------------------------------------\n    if (direction === \"CREDIT\") {\n      if (incomeCategories.has(category)) {\n        // Known income category → income side\n        incomeTransactions.push(tx);\n      } else {\n        // CREDIT but NOT a known income category\n        // e.g. \"OTHER\" with confidence 0.3, or unknown category\n        // → investigate, don't silently drop\n        investigateTransactions.push({\n          ...tx,\n          routeType: \"INVESTIGATE\",\n          _note: `CREDIT transaction with non-income category \"${category}\" : requires review`\n        });\n      }\n      continue;\n    }\n\n    // -------------------------------------------------------\n    // STEP 3: Process DEBIT transactions\n    // -------------------------------------------------------\n    if (direction === \"DEBIT\") {\n      const type = expenseTypeMap[category] || \"DISCRETIONARY\";\n\n      if (type === \"INVESTIGATE\") {\n        investigateTransactions.push({ ...tx, routeType: type });\n        // Still include in total burn — we just can't classify WHERE it went\n        expenseTransactions.push({ ...tx, expenseType: type });\n        continue;\n      }\n\n      if (type === \"SAVINGS\") {\n        savingsTransactions.push({ ...tx, expenseType: type });\n        // Do NOT include in burn rate — investing is not spending\n        continue;\n      }\n\n      // FIXED, ESSENTIAL, DISCRETIONARY, DEBT — all count as expenses\n      expenseTransactions.push({ ...tx, expenseType: type });\n      continue;\n    }\n\n    // -------------------------------------------------------\n    // STEP 4: Unknown direction — shouldn't happen, but don't drop\n    // -------------------------------------------------------\n    investigateTransactions.push({\n      ...tx,\n      routeType: \"INVESTIGATE\",\n      _note: `Unknown direction \"${direction}\" — requires review`\n    });\n  }\n\n  output.push({\n    json: {\n      incomeTransactions: incomeTransactions,\n      expenseTransactions: expenseTransactions,\n      savingsTransactions: savingsTransactions,\n      investigateTransactions: investigateTransactions,\n      excludedTransactions: excludedTransactions,\n      // Preserve document metadata if present\n      documentMonth: item.json.documentMonth || null,\n      sourceFile: item.json.sourceFile || null\n    },\n    // Preserve binary data if present\n    binary: item.binary\n  });\n}\n\nreturn output;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        176
+      ],
+      "id": "668686a7-c10b-4922-8567-c774f78aec3a",
+      "name": "filterIncomeStreams"
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  try {\n    const parsed = JSON.parse(item.json.content.parts[0].text);\n\n    return {\n      json: parsed,\n      binary: item.binary\n    };\n  } catch (err) {\n    return {\n      json: {\n        parseError: true,\n        finishReason: item.json.finishReason,\n        rawText: item.json.content.parts[0].text,\n        error: err.message\n      },\n      binary: item.binary\n    };\n  }\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        784,
+        176
+      ],
+      "id": "fb1cd4f1-096c-4949-9721-1ff4152ee1e8",
+      "name": "structureData"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// EXTRACT FILES — Handle N8N multipart/form-data webhook input\n// ============================================================\n// N8N webhook receives multipart uploads differently:\n//   - body.loanAmount, body.email → in json.body\n//   - uploaded files → in binary property (not body.files)\n//\n// This node extracts each uploaded file as a separate item\n// with the metadata (loanAmount, email) attached to each.\n// ============================================================\n\nconst webhookData = $input.first();\nconst body = webhookData.json.body || {};\nconst binary = webhookData.binary || {};\n\n// Metadata from form fields\nconst metadata = {\n  loanAmount: body.loanAmount || null,\n  email: body.email || null\n};\n\n// Get all binary keys (file0, file1, file2... or data, data0, data1...)\nconst binaryKeys = Object.keys(binary);\n\nif (binaryKeys.length === 0) {\n  throw new Error('No files were uploaded. Please attach at least one bank statement PDF.');\n}\n\n// Create one output item per file, each carrying the metadata\nconst output = binaryKeys.map(key => ({\n  json: {\n    ...metadata\n  },\n  binary: {\n    file: binary[key]\n  }\n}));\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -896,
+        432
+      ],
+      "id": "d240f120-9075-47a2-95ea-077b5294433d",
+      "name": "base64_to_binary"
+    },
+    {
+      "parameters": {
+        "resource": "document",
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-3.1-flash-lite",
+          "mode": "list",
+          "cachedResultName": "models/gemini-3.1-flash-lite"
+        },
+        "text": "You are an expert financial document classifier.\n\nYou will receive exactly one financial document.\n\nClassify the document into exactly one of the following categories:\n\n- BANK_STATEMENT\n- SALARY_SLIP\n- PENSION_STATEMENT\n- TAX_RETURN\n- IDENTITY_DOCUMENT\n- EMPLOYMENT_LETTER\n- OTHER\n- UNKNOWN\n\nClassification Guidelines:\n\n- BANK_STATEMENT:\n  A bank or credit union statement showing transactions, deposits, withdrawals, balances, account details, or account summaries.\n\n- SALARY_SLIP:\n  A payroll or payslip showing employer, employee, gross pay, deductions, net pay, tax, or payroll period.\n\n- PENSION_STATEMENT:\n  A pension payment statement or retirement benefit statement.\n\n- TAX_RETURN:\n  A filed tax return or tax assessment document.\n\n- IDENTITY_DOCUMENT:\n  Passport, driver's license, national ID, residence permit, or similar identification.\n\n- EMPLOYMENT_LETTER:\n  Employment verification letter, offer letter, or employer-issued employment confirmation.\n\nIf the document cannot be confidently classified into one of these categories, return UNKNOWN.\n\nRespond with a JSON object matching this schema exactly:\n\n[{\n  \"documentName\": \"string\",\n  \"documentType\": \"BANK_STATEMENT | SALARY_SLIP | PENSION_STATEMENT | TAX_RETURN | IDENTITY_DOCUMENT | EMPLOYMENT_LETTER | OTHER | UNKNOWN\",\n  \"confidence\": 0.0,\n  \"reason\": \"ubcdybcw\"\n}]\n\nRules:\n- Return valid JSON only.\n- Do not wrap it in markdown.\n- Do not add any extra fields.\n- confidence must be between 0 and 1.\n- reason must be one short sentence.\n- Do not include explanations outside the JSON.\n- Do not invent information that is not present in the document.",
+        "inputType": "binary",
+        "binaryPropertyName": "file",
+        "options": {
+          "maxOutputTokens": 300
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        -640,
+        192
+      ],
+      "id": "816d76e9-e0fa-46f1-af04-ca1131e8c217",
+      "name": "classify_bankStatements",
+      "retryOnFail": true,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "your-id-here",
+          "name": "name-here"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(item => {\n    let parsed = JSON.parse(item.json.content.parts[0].text);\n\n    if (Array.isArray(parsed)) {\n        parsed = parsed[0];\n    }\n\n    return {\n        json: parsed\n    };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        -96
+      ],
+      "id": "32271cc6-c075-4972-afc5-003227737c76",
+      "name": "filter_usefulData",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -32,
+        416
+      ],
+      "id": "d64f8a47-1984-48e0-aec8-686988339b1c",
+      "name": "merge_classificationOutput_and_binaryDocuments"
+    },
+    {
+      "parameters": {
+        "resource": "document",
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-3.1-flash-lite",
+          "mode": "list",
+          "cachedResultName": "models/gemini-3.1-flash-lite"
+        },
+        "text": "You are an expert financial document extraction system.\n\nYou will receive exactly one bank statement as input.\n\nYour task is to extract every transaction from the statement and classify each transaction.\n\nReturn ONLY valid JSON. Do not include markdown, explanations, comments, or any text outside the JSON.\n\n## Rules\n\n1. Extract ALL transactions exactly as they appear in the statement.\n2. The number of transactions in the output MUST exactly equal the number of transactions in the statement.\n3. Do NOT merge, split, ignore, or invent transactions.\n4. Every transaction MUST contain every required field.\n5. Every transaction MUST have a transactionCategory.\n6. Never leave transactionCategory empty, null, or omit it.\n7. If the category is uncertain, choose the single most likely category and lower the classificationConfidence. Never return UNKNOWN or an empty value.\n8. Always return sourceConfidence and classificationConfidence as numbers between 0.0 and 1.0.\n9. Preserve dates, descriptions, amounts, balances, and transaction direction exactly as shown.\n\n## Allowed transactionCategory values\n\n- SALARY\n- GIG_INCOME\n- FREELANCE_INCOME\n- RENT\n- MORTGAGE\n- UTILITIES\n- BILL_PAYMENT\n- GROCERIES\n- DINING\n- SHOPPING\n- TRANSPORT\n- FUEL\n- INSURANCE\n- HEALTHCARE\n- EDUCATION\n- ENTERTAINMENT\n- CASH_WITHDRAWAL\n- CASH_DEPOSIT\n- INTERNAL_TRANSFER\n- TRANSFER\n- REFUND\n- LOAN_PAYMENT\n- TAX\n- INVESTMENT\n- INTEREST\n- ATM\n- FEES\n- SUBSCRIPTION\n- CHARITY\n- TRAVEL\n- OTHER\n\n## Output Format\n\n{\n  \"account\": {\n    \"bankName\": \"string\",\n    \"accountHolder\": \"string\",\n    \"accountNumberLast4\": \"string\",\n    \"statementStartDate\": \"YYYY-MM-DD\",\n    \"statementEndDate\": \"YYYY-MM-DD\",\n    \"currency\": \"string\"\n  },\n  \"transactions\": [\n    {\n      \"date\": \"YYYY-MM-DD\",\n      \"description\": \"string\",\n      \"direction\": \"CREDIT | DEBIT\",\n      \"amount\": 0.00,\n      \"balance\": 0.00,\n      \"source\": \"string\",\n      \"sourceConfidence\": 0.0,\n      \"transactionCategory\": \"One of the allowed values above\",\n      \"classificationConfidence\": 0.0\n    }\n  ]\n}\n\nBefore returning the response, verify that:\n- Every transaction has a transactionCategory.\n- Every transaction has classificationConfidence.\n- Every transaction has sourceConfidence.\n- No required field is missing.\n- The output is valid JSON.",
+        "inputType": "binary",
+        "binaryPropertyName": "file",
+        "options": {
+          "maxOutputTokens": 200000
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        512,
+        416
+      ],
+      "id": "fca62036-a247-455a-ad7a-b0c68c9cc9da",
+      "name": "extrac_and_classify_itIndividualEntries",
+      "retryOnFail": true,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "your-id-here",
+          "name": "name-here"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2736,
+        176
+      ],
+      "id": "e346dcd8-0969-4fbc-a98e-ef31758e728b",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// V2 INCOME FLOW ANALYZER — ENHANCED ANALYTICS ENGINE\n// ============================================================\n// Replaces the V1 underwriting node (\"Code in JavaScript\")\n// \n// INPUT:  V2 aggregation output — income by category × month\n//         with meanMonthlyIncome and projectedAnnualIncome\n//         PLUS expenses by category × month, typed as\n//         FIXED / ESSENTIAL / DISCRETIONARY / DEBT / INVESTIGATE\n//         PLUS savings (INVESTMENT) tracking\n//\n// OUTPUT: Full V2 analytics JSON with:\n//         - Per-stream stability (CV), recurrence, consistency\n//         - Overall stability\n//         - Diversification (HHI)\n//         - Red flag detection\n//         - Sustainable income (floor-weighted)\n//         - Expense analysis (burn rate, fixed vs discretionary)\n//         - Balance buffer analysis (reserves, runway)\n//         - Cash flow (residual income, savings rate)\n//         - Debt analysis (DTI proxy, DTI with new loan)\n//         - Composite underwriting score\n//         - Data confidence indicator\n//         - AI-ready narrative string\n// ============================================================\n\n\n// ===================\n// STEP 0: CONFIGURATION\n// ===================\n// Thresholds are product design decisions, not regulatory prescriptions.\n// CV thresholds based on statistical convention for interpreting dispersion.\n// DTI thresholds ARE industry-prescribed (Fannie Mae, FHA, Non-QM).\n\nconst STABILITY_THRESHOLDS = [\n  { max: 5,        grade: \"A\", label: \"Stable\",   color: \"#22C55E\" },\n  { max: 15,       grade: \"B\", label: \"Moderate\",  color: \"#3B82F6\" },\n  { max: 30,       grade: \"C\", label: \"Variable\",  color: \"#EAB308\" },\n  { max: Infinity, grade: \"D\", label: \"Volatile\",  color: \"#EF4444\" }\n];\n\nconst HHI_THRESHOLDS = [\n  { max: 0.25, label: \"Well-Diversified\" },\n  { max: 0.50, label: \"Moderate\" },\n  { max: 1.00, label: \"Concentrated\" }\n];\n\n// DTI thresholds — these ARE industry-prescribed\n// Fannie Mae: 36% preferred, 45% max\n// FHA: 43% standard, 50% with compensating factors\n// Non-QM: up to 50%, varies by lender\nconst DTI_THRESHOLDS = [\n  { max: 36,       grade: \"STRONG\",   label: \"Within conventional preferred limit (Fannie Mae < 36%)\" },\n  { max: 43,       grade: \"ACCEPTABLE\", label: \"Within FHA standard limit (< 43%)\" },\n  { max: 50,       grade: \"ELEVATED\",  label: \"At Non-QM upper range (< 50%)\" },\n  { max: Infinity, grade: \"HIGH_RISK\", label: \"Exceeds standard DTI thresholds (> 50%)\" }\n];\n\n// Balance runway thresholds\n// Non-QM lenders typically require 3-6 months of reserves\nconst RUNWAY_THRESHOLDS = [\n  { min: 6,  grade: \"STRONG\",   label: \"6+ months of expenses in reserve\" },\n  { min: 3,  grade: \"ADEQUATE\", label: \"3–6 months of expenses in reserve\" },\n  { min: 1,  grade: \"THIN\",     label: \"1–3 months of expenses in reserve\" },\n  { min: 0,  grade: \"CRITICAL\", label: \"Less than 1 month of expenses in reserve\" }\n];\n\n// Balance trend thresholds\nconst TREND_THRESHOLDS = [\n  { min: 10,          grade: \"BUILDING\",  label: \"Reserves growing\" },\n  { min: -10,         grade: \"STABLE\",    label: \"Reserves roughly stable\" },\n  { min: -30,         grade: \"DECLINING\",  label: \"Reserves decreasing\" },\n  { min: -Infinity,   grade: \"DEPLETING\", label: \"Reserves rapidly depleting\" }\n];\n\n// Composite score weights\nconst WEIGHTS = {\n  loanToIncome:     0.20,   // Can they afford it? (reduced from 0.30 — DTI now handles affordability)\n  stability:        0.20,   // Is the income reliable?\n  recurrence:       0.10,   // Does it show up every month?\n  diversification:  0.10,   // Single-source risk?\n  redFlags:         0.10,   // Any warning signs?\n  dti:              0.15,   // Debt burden — industry-standard measure\n  residualIncome:   0.15    // What's left after ALL obligations?\n};\n\n// Assessment tiers based on composite score\nconst ASSESSMENT_TIERS = [\n  { min: 80,  label: \"STRONG\",     color: \"#22C55E\" },\n  { min: 65,  label: \"REASONABLE\", color: \"#3B82F6\" },\n  { min: 45,  label: \"REVIEW\",     color: \"#EAB308\" },\n  { min: 0,   label: \"HIGH_RISK\",  color: \"#EF4444\" }\n];\n\n\n// ===================\n// STEP 1: EXTRACT INPUT DATA\n// ===================\n\nconst income = $input.all()[0].json;\n\nconst rawLoanAmount = $('Webhook').first().json.webhookUrl;\nif (!rawLoanAmount) {\n  throw new Error('Loan amount is required but was not provided.');\n}\n\nconst loanAmount = Number(rawLoanAmount);\n\n// Separate income streams from OVERALL and from expense data\nconst expensesData = income.expenses || {};\nconst savingsData = income.savings || {};\nconst streamNames = Object.keys(income).filter(\n  k => k !== \"OVERALL\" && k !== \"expenses\" && k !== \"savings\"\n);\nconst overallData = income.OVERALL;\n\n// Determine the full set of months across all streams\nconst allMonths = new Set();\nfor (const name of streamNames) {\n  for (const month of Object.keys(income[name].monthlyIncome)) {\n    allMonths.add(month);\n  }\n}\nconst sortedMonths = Array.from(allMonths).sort();\nconst totalMonths = sortedMonths.length;\n\n\n// ===================\n// STEP 2: HELPER FUNCTIONS\n// ===================\n\n/**\n * Compute Coefficient of Variation (CV)\n * CV = (standard deviation / mean) × 100\n * Measures volatility — how much a value swings month to month.\n * Basis: Standard statistical measure. Quantifies what Fannie Mae B3-3.1\n * requires qualitatively: \"income must be stable and likely to continue\"\n */\nfunction computeCV(values) {\n  if (values.length < 2) return 0;\n  const mean = values.reduce((a, b) => a + b, 0) / values.length;\n  if (mean === 0) return 0;\n  const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;\n  const stdDev = Math.sqrt(variance);\n  return Number(((stdDev / mean) * 100).toFixed(2));\n}\n\n/**\n * Map CV value to stability grade\n */\nfunction getStabilityGrade(cv) {\n  for (const tier of STABILITY_THRESHOLDS) {\n    if (cv < tier.max) return { grade: tier.grade, label: tier.label, color: tier.color };\n  }\n  return STABILITY_THRESHOLDS[STABILITY_THRESHOLDS.length - 1];\n}\n\n/**\n * Map HHI value to diversification label\n */\nfunction getHHILabel(hhi) {\n  for (const tier of HHI_THRESHOLDS) {\n    if (hhi <= tier.max) return tier.label;\n  }\n  return \"Concentrated\";\n}\n\n/**\n * Map DTI to grade — these thresholds ARE industry-prescribed\n */\nfunction getDTIGrade(dti) {\n  for (const tier of DTI_THRESHOLDS) {\n    if (dti < tier.max) return { grade: tier.grade, label: tier.label };\n  }\n  return DTI_THRESHOLDS[DTI_THRESHOLDS.length - 1];\n}\n\n/**\n * Map composite score to assessment tier\n */\nfunction getAssessment(score) {\n  for (const tier of ASSESSMENT_TIERS) {\n    if (score >= tier.min) return { label: tier.label, color: tier.color };\n  }\n  return ASSESSMENT_TIERS[ASSESSMENT_TIERS.length - 1];\n}\n\n/**\n * Map balance runway to grade\n */\nfunction getRunwayGrade(months) {\n  for (const tier of RUNWAY_THRESHOLDS) {\n    if (months >= tier.min) return { grade: tier.grade, label: tier.label };\n  }\n  return RUNWAY_THRESHOLDS[RUNWAY_THRESHOLDS.length - 1];\n}\n\n/**\n * Map balance trend to grade\n */\nfunction getTrendGrade(changePercent) {\n  for (const tier of TREND_THRESHOLDS) {\n    if (changePercent >= tier.min) return { grade: tier.grade, label: tier.label };\n  }\n  return TREND_THRESHOLDS[TREND_THRESHOLDS.length - 1];\n}\n\n\n// ===================\n// STEP 3: PER-STREAM INCOME ANALYTICS\n// ===================\n// For each income stream:\n//   - Stability (CV + grade)\n//   - Recurrence (months present / total months)\n//   - Consistency (min, max, band = (max-min)/mean)\n\nconst incomeStreams = {};\n\nfor (const name of streamNames) {\n  const stream = income[name];\n  const monthlyValues = Object.values(stream.monthlyIncome);\n  const monthlyKeys = Object.keys(stream.monthlyIncome);\n\n  // 3a: Stability (CV)\n  const cv = computeCV(monthlyValues);\n  const stabilityGrade = getStabilityGrade(cv);\n\n  // 3b: Recurrence\n  const monthsPresent = monthlyKeys.length;\n  const recurrenceRate = Number((monthsPresent / totalMonths).toFixed(2));\n\n  // 3c: Consistency\n  const min = Math.min(...monthlyValues);\n  const max = Math.max(...monthlyValues);\n  const mean = stream.meanMonthlyIncome;\n  const band = mean > 0 ? Number(((max - min) / mean).toFixed(3)) : 0;\n\n  incomeStreams[name] = {\n    monthlyIncome: stream.monthlyIncome,\n    meanMonthlyIncome: mean,\n    projectedAnnualIncome: stream.projectedAnnualIncome,\n    stability: {\n      cv: cv,\n      grade: stabilityGrade.grade,\n      label: stabilityGrade.label\n    },\n    recurrence: {\n      monthsPresent: monthsPresent,\n      totalMonths: totalMonths,\n      rate: recurrenceRate\n    },\n    consistency: {\n      min: min,\n      max: max,\n      band: band\n    }\n  };\n}\n\n\n// ===================\n// STEP 4: OVERALL INCOME STABILITY\n// ===================\n\nconst overallMonthlyValues = Object.values(overallData.monthlyIncome);\nconst overallCV = computeCV(overallMonthlyValues);\nconst overallStability = getStabilityGrade(overallCV);\n\nconst overall = {\n  monthlyIncome: overallData.monthlyIncome,\n  meanMonthlyIncome: overallData.meanMonthlyIncome,\n  projectedAnnualIncome: overallData.projectedAnnualIncome,\n  stability: {\n    cv: overallCV,\n    grade: overallStability.grade,\n    label: overallStability.label\n  },\n  totalMonths: totalMonths,\n  streamCount: streamNames.length\n};\n\n\n// ===================\n// STEP 5: DIVERSIFICATION (HHI)\n// ===================\n\nconst totalProjectedAnnual = overallData.projectedAnnualIncome;\nconst shares = {};\nlet hhi = 0;\n\nfor (const name of streamNames) {\n  const share = totalProjectedAnnual > 0\n    ? income[name].projectedAnnualIncome / totalProjectedAnnual\n    : 0;\n  shares[name] = Number(share.toFixed(3));\n  hhi += share * share;\n}\n\nhhi = Number(hhi.toFixed(3));\nconst hhiLabel = getHHILabel(hhi);\n\nconst diversification = {\n  hhi: hhi,\n  grade: hhiLabel,\n  shares: shares\n};\n\n\n// ===================\n// STEP 6: RED FLAG DETECTION\n// ===================\n// Domain-driven checks that a vibe coder wouldn't think of.\n// Each flag gets a type, severity, and plain-English explanation.\n\nconst redFlags = [];\n\nfor (const name of streamNames) {\n  const stream = income[name];\n  const monthlyValues = Object.values(stream.monthlyIncome);\n  const monthlyEntries = Object.entries(stream.monthlyIncome);\n  const mean = stream.meanMonthlyIncome;\n\n  // FLAG 1: Round-number deposits (common in fabricated statements)\n  for (const [month, amount] of monthlyEntries) {\n    if (amount >= 500 && amount % 100 === 0) {\n      redFlags.push({\n        type: \"ROUND_NUMBER_DEPOSIT\",\n        severity: \"WARNING\",\n        stream: name,\n        month: month,\n        amount: amount,\n        explanation: `Round-number deposit ($${amount.toLocaleString()}) in ${name.replace(/_/g, ' ').toLowerCase()}. Round deposits are a known indicator of fabricated statements and may warrant verification.`\n      });\n    }\n  }\n\n  // FLAG 2: One-time spike (single deposit > 3× the stream's monthly mean)\n  for (const [month, amount] of monthlyEntries) {\n    if (mean > 0 && amount > mean * 3) {\n      redFlags.push({\n        type: \"INCOME_SPIKE\",\n        severity: \"WARNING\",\n        stream: name,\n        month: month,\n        amount: amount,\n        explanation: `Unusually large deposit ($${amount.toLocaleString()}) in ${name.replace(/_/g, ' ').toLowerCase()} — ${(amount / mean).toFixed(1)}× the monthly average. One-time spikes inflate income projections unrealistically.`\n      });\n    }\n  }\n\n  // FLAG 3: Single-appearance stream (only 1 of N months)\n  if (monthlyValues.length === 1 && totalMonths > 1) {\n    redFlags.push({\n      type: \"SINGLE_APPEARANCE\",\n      severity: \"INFO\",\n      stream: name,\n      month: monthlyEntries[0][0],\n      amount: monthlyEntries[0][1],\n      explanation: `${name.replace(/_/g, ' ')} appeared in only 1 of ${totalMonths} months. Cannot establish recurrence — treat as one-time income.`\n    });\n  }\n\n  // FLAG 4: Missing months (stream present in some but not all months)\n  if (monthlyValues.length > 1 && monthlyValues.length < totalMonths) {\n    const presentMonths = new Set(Object.keys(stream.monthlyIncome));\n    const missingMonths = sortedMonths.filter(m => !presentMonths.has(m));\n    redFlags.push({\n      type: \"MISSING_MONTHS\",\n      severity: \"WARNING\",\n      stream: name,\n      month: missingMonths.join(\", \"),\n      amount: null,\n      explanation: `${name.replace(/_/g, ' ')} missing in ${missingMonths.join(\", \")}. Income may not be ongoing — verify with borrower.`\n    });\n  }\n}\n\n\n// ===================\n// STEP 7: SUSTAINABLE INCOME\n// ===================\n// Floor-weighted: use each stream's minimum month instead of mean.\n// This is stress-test thinking — what if next month = worst month?\n// Basis: Fannie Mae requires declining income to be underwritten\n// at the lower amount. We apply this per-stream.\n\nlet sustainableMonthly = 0;\nfor (const name of streamNames) {\n  const monthlyValues = Object.values(income[name].monthlyIncome);\n  const floorValue = Math.min(...monthlyValues);\n  sustainableMonthly += floorValue;\n}\n\nconst sustainableAnnual = sustainableMonthly * 12;\nconst projectedAnnual = overallData.projectedAnnualIncome;\nconst discountFromProjected = projectedAnnual > 0\n  ? Number((((projectedAnnual - sustainableAnnual) / projectedAnnual) * 100).toFixed(1))\n  : 0;\n\nconst sustainableIncome = {\n  monthlyFloorWeighted: Number(sustainableMonthly.toFixed(2)),\n  annualFloorWeighted: Number(sustainableAnnual.toFixed(2)),\n  discountFromProjected: discountFromProjected\n};\n\n\n// ===================\n// STEP 8: EXPENSE ANALYSIS\n// ===================\n// Process the expense data from the aggregation node.\n\nconst expSummary = expensesData.summary || {};\nconst expByType = expensesData.byType || {};\nconst expCategories = expensesData.categories || {};\n\n// 8a: Expense burn stability — is spending predictable?\nconst expMonthlyTotals = expensesData.monthlyTotals || {};\nconst expMonthlyValues = Object.values(expMonthlyTotals);\nconst burnCV = computeCV(expMonthlyValues);\nconst burnStability = getStabilityGrade(burnCV);\n\nconst totalMonthlyBurn = expSummary.totalMonthlyBurn || 0;\n\nconst expenses = {\n  categories: expCategories,\n  monthlyTotals: expMonthlyTotals,\n  byType: expByType,\n  summary: {\n    totalMonthlyBurn: totalMonthlyBurn,\n    fixedMonthly: expSummary.fixedMonthly || 0,\n    essentialMonthly: expSummary.essentialMonthly || 0,\n    discretionaryMonthly: expSummary.discretionaryMonthly || 0,\n    debtMonthly: expSummary.debtMonthly || 0,\n    investigateMonthly: expSummary.investigateMonthly || 0,\n    fixedExpenseRatio: expSummary.fixedExpenseRatio || 0,\n    burnStability: {\n      cv: burnCV,\n      grade: burnStability.grade,\n      label: burnStability.label\n    }\n  }\n};\n\n\n// ===================\n// STEP 8.5: BALANCE BUFFER ANALYSIS\n// ===================\n// Uses balance fields from transactions to assess:\n//   - Financial cushion (average, min, max balance)\n//   - Runway (how many months of expenses the min balance covers)\n//   - Trend (building reserves vs depleting)\n//\n// Industry basis: Non-QM lenders require 3-6 months of reserves.\n// Angel Oak, Deephaven, A&D Mortgage all document this.\n// This is the bank-statement equivalent of reserve verification.\n\n// Collect all balance data points from the checkConfidence node\n// which has the full flat transaction list. Fall back to filterTransactions.\nlet allTxForBalance = [];\n\ntry {\n  const checkConfData = $('checkConfidence').first().json;\n  if (checkConfData && checkConfData.allTransactions) {\n    allTxForBalance = checkConfData.allTransactions;\n  }\n} catch (e) {\n  // checkConfidence node not available — pull from filterTransactions\n  try {\n    const filterItems = $('filterTransactions').all();\n    for (const item of filterItems) {\n      const d = item.json;\n      const arrays = [\n        d.incomeTransactions || [],\n        d.expenseTransactions || [],\n        d.savingsTransactions || [],\n        d.investigateTransactions || [],\n        d.excludedTransactions || []\n      ];\n      for (const arr of arrays) {\n        allTxForBalance.push(...arr);\n      }\n    }\n  } catch (e2) {\n    // No balance data available\n  }\n}\n\n// Extract valid balance values (non-null, non-zero)\n// Zero balances likely indicate parse failures, not actual $0 balance\nconst balancePoints = [];\nfor (const tx of allTxForBalance) {\n  const bal = tx.balance ?? null;\n  if (bal !== null && bal !== undefined && bal > 0) {\n    balancePoints.push({\n      date: tx.date,\n      balance: bal\n    });\n  }\n}\n\n// Sort by date to get chronological order\nbalancePoints.sort((a, b) => a.date.localeCompare(b.date));\n\nlet balanceBuffer;\n\nif (balancePoints.length >= 2) {\n  const balanceValues = balancePoints.map(bp => bp.balance);\n\n  const avgBalance = Number(\n    (balanceValues.reduce((a, b) => a + b, 0) / balanceValues.length).toFixed(2)\n  );\n  const minBalance = Number(Math.min(...balanceValues).toFixed(2));\n  const maxBalance = Number(Math.max(...balanceValues).toFixed(2));\n\n  // Runway: how many months of expenses can they survive on their minimum balance?\n  const runwayMonths = totalMonthlyBurn > 0\n    ? Number((minBalance / totalMonthlyBurn).toFixed(1))\n    : null;\n\n  const runwayGradeResult = runwayMonths !== null\n    ? getRunwayGrade(runwayMonths)\n    : { grade: \"UNKNOWN\", label: \"Cannot calculate — no expense data\" };\n\n  // Trend: compare first and last balance\n  const startBalance = balancePoints[0].balance;\n  const endBalance = balancePoints[balancePoints.length - 1].balance;\n  const balanceChange = Number((endBalance - startBalance).toFixed(2));\n  const balanceChangePercent = startBalance > 0\n    ? Number(((balanceChange / startBalance) * 100).toFixed(1))\n    : 0;\n\n  const trendGradeResult = getTrendGrade(balanceChangePercent);\n\n  balanceBuffer = {\n    averageBalance: avgBalance,\n    minBalance: minBalance,\n    maxBalance: maxBalance,\n    balanceRunway: {\n      months: runwayMonths,\n      grade: runwayGradeResult.grade,\n      label: runwayGradeResult.label\n    },\n    balanceTrend: {\n      startBalance: startBalance,\n      endBalance: endBalance,\n      change: balanceChange,\n      changePercent: balanceChangePercent,\n      grade: trendGradeResult.grade,\n      label: trendGradeResult.label\n    },\n    dataPoints: balancePoints.length,\n    note: `Based on ${balancePoints.length} transaction balance snapshots across the analysis period.`\n  };\n\n  // RED FLAGS — Balance-specific\n  // Low balance: minimum balance covers less than 1 month of expenses\n  if (runwayMonths !== null && runwayMonths < 1) {\n    redFlags.push({\n      type: \"LOW_BALANCE\",\n      severity: \"WARNING\",\n      stream: \"BALANCE\",\n      month: balancePoints.find(bp => bp.balance === minBalance)?.date || \"unknown\",\n      amount: minBalance,\n      explanation: `Minimum account balance ($${minBalance.toLocaleString()}) covers only ${runwayMonths} months of expenses. Borrower has minimal financial cushion.`\n    });\n  }\n\n  // Depleting balance: balance dropped 20%+ over the period\n  if (balanceChangePercent <= -20) {\n    redFlags.push({\n      type: \"DEPLETING_BALANCE\",\n      severity: \"WARNING\",\n      stream: \"BALANCE\",\n      month: `${balancePoints[0].date} → ${balancePoints[balancePoints.length - 1].date}`,\n      amount: balanceChange,\n      explanation: `Account balance decreased ${Math.abs(balanceChangePercent)}% over the analysis period ($${startBalance.toLocaleString()} → $${endBalance.toLocaleString()}). Borrower may be depleting reserves.`\n    });\n  }\n\n} else {\n  // Not enough balance data\n  balanceBuffer = {\n    averageBalance: null,\n    minBalance: null,\n    maxBalance: null,\n    balanceRunway: {\n      months: null,\n      grade: \"INSUFFICIENT_DATA\",\n      label: \"Not enough balance data points to analyze\"\n    },\n    balanceTrend: {\n      startBalance: null,\n      endBalance: null,\n      change: null,\n      changePercent: null,\n      grade: \"INSUFFICIENT_DATA\",\n      label: \"Not enough balance data points to analyze\"\n    },\n    dataPoints: balancePoints.length,\n    note: \"Insufficient balance data for buffer analysis.\"\n  };\n}\n\n\n// ===================\n// STEP 9: CASH FLOW ANALYSIS\n// ===================\n// Residual income = income - expenses per month\n// This answers: \"After paying all bills, is there enough left?\"\n\nconst monthlyResidual = {};\nconst meanMonthlyIncome = overallData.meanMonthlyIncome;\n\nfor (const month of sortedMonths) {\n  const incomeVal = overallData.monthlyIncome[month] || 0;\n  const expenseVal = expMonthlyTotals[month] || 0;\n  monthlyResidual[month] = Number((incomeVal - expenseVal).toFixed(2));\n}\n\nconst residualValues = Object.values(monthlyResidual);\nconst meanResidual = residualValues.length > 0\n  ? Number((residualValues.reduce((a, b) => a + b, 0) / residualValues.length).toFixed(2))\n  : 0;\n\nconst residualCV = computeCV(residualValues.map(v => Math.max(v, 0)));\nconst residualStability = getStabilityGrade(residualCV);\n\n// Savings rate: what % of income is left after expenses?\nconst savingsRate = meanMonthlyIncome > 0\n  ? Number(((meanResidual / meanMonthlyIncome) * 100).toFixed(1))\n  : 0;\n\nconst cashFlow = {\n  monthlyResidual: monthlyResidual,\n  meanResidual: meanResidual,\n  residualStability: {\n    cv: residualCV,\n    grade: residualStability.grade,\n    label: residualStability.label\n  },\n  savingsRate: savingsRate\n};\n\n\n// ===================\n// STEP 10: DEBT ANALYSIS (DTI)\n// ===================\n// DTI = Monthly Debt Payments / Gross Monthly Income × 100\n// DTI Thresholds ARE industry-prescribed.\n\nconst identifiedDebtPayments = expSummary.debtMonthly || 0;\n\nconst estimatedDTI = meanMonthlyIncome > 0\n  ? Number(((identifiedDebtPayments / meanMonthlyIncome) * 100).toFixed(1))\n  : 0;\n\n// Estimate monthly payment for the new loan\n// Using simple annuity formula: PMT = P × [r(1+r)^n] / [(1+r)^n - 1]\n// Assumptions: 8% annual rate, 36-month term (personal loan defaults)\nconst annualRate = 0.08;\nconst monthlyRate = annualRate / 12;\nconst loanTermMonths = 36;\nconst estimatedNewLoanPayment = monthlyRate > 0\n  ? Number((loanAmount * (monthlyRate * Math.pow(1 + monthlyRate, loanTermMonths)) /\n    (Math.pow(1 + monthlyRate, loanTermMonths) - 1)).toFixed(2))\n  : Number((loanAmount / loanTermMonths).toFixed(2));\n\nconst dtiWithNewLoan = meanMonthlyIncome > 0\n  ? Number((((identifiedDebtPayments + estimatedNewLoanPayment) / meanMonthlyIncome) * 100).toFixed(1))\n  : 0;\n\nconst dtiGradeResult = getDTIGrade(dtiWithNewLoan);\n\nconst debtAnalysis = {\n  identifiedDebtPayments: identifiedDebtPayments,\n  estimatedDTI: estimatedDTI,\n  estimatedNewLoanMonthlyPayment: estimatedNewLoanPayment,\n  dtiWithNewLoan: dtiWithNewLoan,\n  dtiGrade: dtiGradeResult.grade,\n  dtiLabel: dtiGradeResult.label,\n  assumptions: {\n    annualRate: \"8%\",\n    termMonths: 36,\n    note: \"Estimated personal loan terms for DTI projection. Actual terms may vary.\"\n  }\n};\n\n\n// ===================\n// STEP 11: DATA CONFIDENCE\n// ===================\n\nlet confidenceLevel, confidenceNote;\n\nif (totalMonths >= 12) {\n  confidenceLevel = \"High\";\n  confidenceNote = \"Meets Non-QM bank statement program standards (12+ months).\";\n} else if (totalMonths >= 6) {\n  confidenceLevel = \"Good\";\n  confidenceNote = `Based on ${totalMonths} months. 12+ months preferred for full confidence per Non-QM standards.`;\n} else if (totalMonths >= 3) {\n  confidenceLevel = \"Moderate\";\n  confidenceNote = `Preliminary assessment based on ${totalMonths} months. Non-QM programs require 12–24 months for production underwriting.`;\n} else {\n  confidenceLevel = \"Low\";\n  confidenceNote = `Only ${totalMonths} month(s) of data. Insufficient for reliable income assessment. Non-QM standards require 12–24 months.`;\n}\n\nconst dataConfidence = {\n  monthsAnalyzed: totalMonths,\n  industryStandard: \"12–24 months (Non-QM bank statement programs)\",\n  confidenceLevel: confidenceLevel,\n  note: confidenceNote\n};\n\n\n// ===================\n// STEP 12: COMPOSITE SCORE\n// ===================\n\n// 12a: Loan-to-income sub-score\nconst loanToIncome = projectedAnnual > 0\n  ? Number(((loanAmount / projectedAnnual) * 100).toFixed(1))\n  : 100;\n\nlet ltiScore;\nif (loanToIncome < 15) ltiScore = 100;\nelse if (loanToIncome < 30) ltiScore = 70;\nelse if (loanToIncome < 50) ltiScore = 40;\nelse ltiScore = 10;\n\n// 12b: Stability sub-score (weighted avg CV across streams)\nlet weightedCV = 0;\nlet totalWeight = 0;\nfor (const name of streamNames) {\n  const share = shares[name] || 0;\n  const cv = incomeStreams[name].stability.cv;\n  weightedCV += cv * share;\n  totalWeight += share;\n}\nif (totalWeight > 0) weightedCV = weightedCV / totalWeight;\n\nlet stabilityScore;\nif (weightedCV < 5) stabilityScore = 100;\nelse if (weightedCV < 15) stabilityScore = 75;\nelse if (weightedCV < 30) stabilityScore = 45;\nelse stabilityScore = 15;\n\n// 12c: Recurrence sub-score\nlet recurrenceScore = 0;\nlet recurrenceCount = 0;\nfor (const name of streamNames) {\n  recurrenceScore += incomeStreams[name].recurrence.rate;\n  recurrenceCount++;\n}\nrecurrenceScore = recurrenceCount > 0\n  ? Math.round((recurrenceScore / recurrenceCount) * 100)\n  : 0;\n\n// 12d: Diversification sub-score\nlet diversificationScore;\nif (hhi < 0.25) diversificationScore = 100;\nelse if (hhi < 0.50) diversificationScore = 60;\nelse diversificationScore = 25;\n\n// 12e: Red flag penalty\nlet redFlagScore = 100;\nfor (const flag of redFlags) {\n  if (flag.severity === \"CRITICAL\") redFlagScore -= 30;\n  else if (flag.severity === \"WARNING\") redFlagScore -= 10;\n  else if (flag.severity === \"INFO\") redFlagScore -= 3;\n}\nredFlagScore = Math.max(0, redFlagScore);\n\n// 12f: DTI sub-score\nlet dtiScore;\nif (dtiWithNewLoan < 36) dtiScore = 100;\nelse if (dtiWithNewLoan < 43) dtiScore = 65;\nelse if (dtiWithNewLoan < 50) dtiScore = 35;\nelse dtiScore = 10;\n\n// 12g: Residual income sub-score\nlet residualScore;\nif (savingsRate > 40) residualScore = 100;\nelse if (savingsRate > 25) residualScore = 80;\nelse if (savingsRate > 10) residualScore = 50;\nelse if (savingsRate > 0) residualScore = 25;\nelse residualScore = 5;\n\n// 12h: Compute weighted composite\nconst compositeScore = Math.round(\n  ltiScore * WEIGHTS.loanToIncome +\n  stabilityScore * WEIGHTS.stability +\n  recurrenceScore * WEIGHTS.recurrence +\n  diversificationScore * WEIGHTS.diversification +\n  redFlagScore * WEIGHTS.redFlags +\n  dtiScore * WEIGHTS.dti +\n  residualScore * WEIGHTS.residualIncome\n);\n\nconst assessmentResult = getAssessment(compositeScore);\n\n\n// ===================\n// STEP 13: UNDERWRITING SUMMARY\n// ===================\n\nconst loanToSustainableIncome = sustainableAnnual > 0\n  ? Number(((loanAmount / sustainableAnnual) * 100).toFixed(1))\n  : 100;\n\nconst incomeMultiple = projectedAnnual > 0\n  ? Number((projectedAnnual / loanAmount).toFixed(2))\n  : 0;\n\nconst underwriting = {\n  loanAmountRequested: loanAmount,\n  loanToIncome: loanToIncome,\n  loanToSustainableIncome: loanToSustainableIncome,\n  incomeMultiple: incomeMultiple,\n  compositeScore: compositeScore,\n  compositeBreakdown: {\n    loanToIncomeScore: ltiScore,\n    stabilityScore: stabilityScore,\n    recurrenceScore: recurrenceScore,\n    diversificationScore: diversificationScore,\n    redFlagScore: redFlagScore,\n    dtiScore: dtiScore,\n    residualIncomeScore: residualScore\n  },\n  compositeWeights: WEIGHTS,\n  assessment: assessmentResult.label,\n  assessmentColor: assessmentResult.color\n};\n\n\n// ===================\n// STEP 14: NARRATIVE\n// ===================\n\nconst streamSummaries = streamNames.map(name => {\n  const s = incomeStreams[name];\n  const label = name.replace(/_/g, ' ').toLowerCase();\n  return `${label} (CV: ${s.stability.cv}%, ${s.stability.label}, floor: $${s.consistency.min.toLocaleString()})`;\n}).join(\"; \");\n\nconst flagSummary = redFlags.length > 0\n  ? ` ${redFlags.length} flag(s) detected: ${redFlags.map(f => f.type.replace(/_/g, ' ').toLowerCase()).join(\", \")}.`\n  : \" No red flags detected.\";\n\nconst expenseSummary = expenses.summary.totalMonthlyBurn > 0\n  ? ` Monthly expenses: $${expenses.summary.totalMonthlyBurn.toLocaleString()} (${(expenses.summary.fixedExpenseRatio * 100).toFixed(0)}% fixed). Residual income: $${meanResidual.toLocaleString()}/month (${savingsRate}% savings rate).`\n  : \"\";\n\nconst dtiSummary = identifiedDebtPayments > 0\n  ? ` Existing debt payments: $${identifiedDebtPayments.toLocaleString()}/month. DTI with new loan: ${dtiWithNewLoan}% — ${dtiGradeResult.grade.toLowerCase()}.`\n  : ` No existing debt payments identified. DTI with new loan: ${dtiWithNewLoan}% — ${dtiGradeResult.grade.toLowerCase()}.`;\n\n// Balance narrative\nlet balanceNarrative = \"\";\nif (balanceBuffer && balanceBuffer.averageBalance !== null) {\n  const rb = balanceBuffer.balanceRunway;\n  const bt = balanceBuffer.balanceTrend;\n  balanceNarrative = ` Account balance: avg $${balanceBuffer.averageBalance.toLocaleString()}, min $${balanceBuffer.minBalance.toLocaleString()}. Balance runway: ${rb.months} months — ${rb.grade.toLowerCase()}. Balance trend: ${bt.label.toLowerCase()} (${bt.changePercent > 0 ? '+' : ''}${bt.changePercent}%).`;\n}\n\nconst narrative = `Borrower shows $${Math.round(projectedAnnual / 1000)}K projected annual income across ${streamNames.length} stream(s) with ${hhiLabel.toLowerCase()} diversification (HHI: ${hhi}). Per-stream analysis: ${streamSummaries}. Overall income stability: ${overallStability.label} (CV: ${overallCV}%).${flagSummary}${expenseSummary}${dtiSummary}${balanceNarrative} Sustainable income (floor-weighted): $${Math.round(sustainableAnnual / 1000)}K (${discountFromProjected}% discount from projected). Loan-to-sustainable-income: ${loanToSustainableIncome}%. Data confidence: ${confidenceLevel} (${totalMonths} months analyzed; industry standard: 12–24). Composite score: ${compositeScore}/100. Assessment: ${assessmentResult.label}.`;\n\n\n// ===================\n// STEP 15: RETURN FINAL OUTPUT\n// ===================\n\nreturn [\n  {\n    json: {\n      incomeStreams: incomeStreams,\n      overall: overall,\n      diversification: diversification,\n      redFlags: redFlags,\n      sustainableIncome: sustainableIncome,\n      expenses: expenses,\n      balanceBuffer: balanceBuffer,\n      cashFlow: cashFlow,\n      debtAnalysis: debtAnalysis,\n      savings: {\n        monthlyInvestment: savingsData.monthlyInvestment || {},\n        meanMonthly: savingsData.meanMonthly || 0\n      },\n      underwriting: underwriting,\n      dataConfidence: dataConfidence,\n      narrative: narrative\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        160
+      ],
+      "id": "1476a4b3-71d9-41d5-97a2-53009b2dc257",
+      "name": "analyticsEngine"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// V2 AGGREGATION — Income + Expenses by Category × Month\n// ============================================================\n// Replaces V1 \"Code in JavaScript2\" (income-only aggregation).\n//\n// V1: Aggregated income by category × month, computed mean + projected annual.\n// V2: Does the same for income AND adds full expense aggregation:\n//     - Expenses by category × month\n//     - Expense type breakdown (FIXED / ESSENTIAL / DISCRETIONARY / DEBT)\n//     - Monthly totals for each type\n//     - Savings tracking (INVESTMENT — positive signal)\n//     - Investigate tracking (CASH_WITHDRAWAL, ATM — unclassifiable)\n//\n// INPUT:  Output from checkConfidence node — contains allTransactions\n//         (flat array with _sourceArray field on each transaction)\n//         OR output from filterTransactions node (multiple items with\n//         incomeTransactions, expenseTransactions arrays)\n//\n// OUTPUT: Full aggregation for both sides, ready for V2 analytics engine\n// ============================================================\n\n\n// ===================\n// HELPER: Safe rounding to avoid floating point noise\n// ===================\n// JavaScript floating point: 146.82 + 63.14 = 209.95999999999998\n// This helper ensures all monetary values stay clean.\nfunction r(value) {\n  return Number(value.toFixed(2));\n}\n\n\n// ===================\n// STEP 0: COLLECT ALL TRANSACTIONS — HANDLE BOTH INPUT FORMATS\n// ===================\n// This node can receive input from two sources:\n//   A) checkConfidence node → single item with allTransactions flat array\n//   B) filterTransactions node → multiple items with typed arrays\n//\n// We detect the format and extract accordingly.\n\nconst allIncome = [];\nconst allExpenses = [];\nconst allSavings = [];\nconst allInvestigate = [];\n\nconst items = $input.all();\nconst firstItem = items[0]?.json;\n\nif (firstItem && firstItem.allTransactions) {\n  // -------------------------------------------------------\n  // FORMAT A: checkConfidence output (flat allTransactions array)\n  // Each transaction has _sourceArray telling us where it belongs.\n  // Skip ignored transactions (human marked them for exclusion).\n  // -------------------------------------------------------\n  for (const tx of firstItem.allTransactions) {\n    // Skip transactions that human marked as ignored during HITL review\n    if (tx.ignored) continue;\n\n    switch (tx._sourceArray) {\n      case \"incomeTransactions\":\n        allIncome.push(tx);\n        break;\n      case \"expenseTransactions\":\n        allExpenses.push(tx);\n        break;\n      case \"savingsTransactions\":\n        allSavings.push(tx);\n        break;\n      case \"investigateTransactions\":\n        allInvestigate.push(tx);\n        break;\n      // excludedTransactions — intentionally not collected\n    }\n  }\n} else {\n  // -------------------------------------------------------\n  // FORMAT B: filterTransactions output (multiple items with arrays)\n  // This is the V1-compatible format, kept as fallback.\n  // -------------------------------------------------------\n  for (const item of items) {\n    const data = item.json;\n\n    if (data.incomeTransactions) {\n      allIncome.push(...data.incomeTransactions);\n    }\n    if (data.expenseTransactions) {\n      allExpenses.push(...data.expenseTransactions);\n    }\n    if (data.savingsTransactions) {\n      allSavings.push(...data.savingsTransactions);\n    }\n    if (data.investigateTransactions) {\n      allInvestigate.push(...data.investigateTransactions);\n    }\n  }\n}\n\n\n// ===================\n// STEP 1: AGGREGATE INCOME (same logic as V1)\n// ===================\n// Group by category → month → sum amounts\n// Then compute mean monthly and projected annual per category\n\nconst incomeByCategory = {};\nconst overallMonthlyIncome = {};\n\nfor (const tx of allIncome) {\n  const category = tx.transactionCategory;\n  const month = tx.date.slice(0, 7); // YYYY-MM\n  const amount = Math.abs(tx.amount);\n\n  // Per-category aggregation\n  if (!incomeByCategory[category]) {\n    incomeByCategory[category] = { monthlyIncome: {} };\n  }\n  incomeByCategory[category].monthlyIncome[month] =\n    r((incomeByCategory[category].monthlyIncome[month] || 0) + amount);\n\n  // Overall monthly total\n  overallMonthlyIncome[month] =\n    r((overallMonthlyIncome[month] || 0) + amount);\n}\n\n// Compute mean and projected annual for each income category\nconst incomeCategories = Object.keys(incomeByCategory);\n\nfor (const category of incomeCategories) {\n  const months = Object.keys(incomeByCategory[category].monthlyIncome);\n  const values = Object.values(incomeByCategory[category].monthlyIncome);\n\n  if (months.length === 0) {\n    delete incomeByCategory[category];\n    continue;\n  }\n\n  const total = values.reduce((a, b) => a + b, 0);\n  const mean = total / months.length;\n\n  incomeByCategory[category].meanMonthlyIncome = r(mean);\n  incomeByCategory[category].projectedAnnualIncome = r(mean * 12);\n}\n\n// Overall income statistics\nconst overallIncomeValues = Object.values(overallMonthlyIncome);\nconst overallIncomeTotal = overallIncomeValues.reduce((a, b) => a + b, 0);\nconst overallIncomeMean = overallIncomeValues.length > 0\n  ? overallIncomeTotal / overallIncomeValues.length\n  : 0;\n\nconst OVERALL_INCOME = {\n  monthlyIncome: overallMonthlyIncome,\n  meanMonthlyIncome: r(overallIncomeMean),\n  projectedAnnualIncome: r(overallIncomeMean * 12)\n};\n\n\n// ===================\n// STEP 2: AGGREGATE EXPENSES (NEW in V2)\n// ===================\n// Same pattern as income: group by category → month → sum amounts\n// PLUS: track expense type (FIXED/ESSENTIAL/DISCRETIONARY/DEBT)\n\nconst expenseByCategory = {};\nconst overallMonthlyExpense = {};\n\n// Monthly totals by expense type\nconst monthlyByType = {\n  FIXED: {},\n  ESSENTIAL: {},\n  DISCRETIONARY: {},\n  DEBT: {},\n  INVESTIGATE: {}\n};\n\nfor (const tx of allExpenses) {\n  const category = tx.transactionCategory;\n  const month = tx.date.slice(0, 7); // YYYY-MM\n  const amount = Math.abs(tx.amount);\n  const expenseType = tx.expenseType; // Set by filterTransactions node\n\n  // Per-category aggregation\n  if (!expenseByCategory[category]) {\n    expenseByCategory[category] = {\n      monthlyExpense: {},\n      expenseType: expenseType\n    };\n  }\n  expenseByCategory[category].monthlyExpense[month] =\n    r((expenseByCategory[category].monthlyExpense[month] || 0) + amount);\n\n  // Overall monthly total\n  overallMonthlyExpense[month] =\n    r((overallMonthlyExpense[month] || 0) + amount);\n\n  // Monthly by type\n  if (monthlyByType[expenseType]) {\n    monthlyByType[expenseType][month] =\n      r((monthlyByType[expenseType][month] || 0) + amount);\n  }\n}\n\n// Compute mean monthly for each expense category\nconst expenseCategories = Object.keys(expenseByCategory);\n\nfor (const category of expenseCategories) {\n  const months = Object.keys(expenseByCategory[category].monthlyExpense);\n  const values = Object.values(expenseByCategory[category].monthlyExpense);\n\n  if (months.length === 0) {\n    delete expenseByCategory[category];\n    continue;\n  }\n\n  const total = values.reduce((a, b) => a + b, 0);\n  const mean = total / months.length;\n\n  expenseByCategory[category].meanMonthly = r(mean);\n}\n\n// Overall expense statistics\nconst overallExpenseValues = Object.values(overallMonthlyExpense);\nconst overallExpenseTotal = overallExpenseValues.reduce((a, b) => a + b, 0);\nconst overallExpenseMean = overallExpenseValues.length > 0\n  ? overallExpenseTotal / overallExpenseValues.length\n  : 0;\n\n\n// ===================\n// STEP 3: EXPENSE TYPE SUMMARIES\n// ===================\n// Compute mean monthly for each expense type (FIXED, ESSENTIAL, etc.)\n\nfunction meanOfObject(obj) {\n  const values = Object.values(obj);\n  if (values.length === 0) return 0;\n  return r(values.reduce((a, b) => a + b, 0) / values.length);\n}\n\nconst fixedMonthly = meanOfObject(monthlyByType.FIXED);\nconst essentialMonthly = meanOfObject(monthlyByType.ESSENTIAL);\nconst discretionaryMonthly = meanOfObject(monthlyByType.DISCRETIONARY);\nconst debtMonthly = meanOfObject(monthlyByType.DEBT);\nconst investigateMonthly = meanOfObject(monthlyByType.INVESTIGATE);\n\nconst totalMonthlyBurn = r(overallExpenseMean);\n\n// Fixed expense ratio: what share of total spending is non-negotiable?\n// Fixed = FIXED + DEBT (both are obligations the borrower can't easily reduce)\nconst fixedPlusDebt = r(fixedMonthly + debtMonthly);\nconst fixedExpenseRatio = totalMonthlyBurn > 0\n  ? Number((fixedPlusDebt / totalMonthlyBurn).toFixed(3))\n  : 0;\n\n\n// ===================\n// STEP 4: SAVINGS TRACKING (INVESTMENT)\n// ===================\n// Savings are NOT expenses — they're a positive signal.\n// Track them separately.\n\nconst savingsByMonth = {};\n\nfor (const tx of allSavings) {\n  const month = tx.date.slice(0, 7);\n  const amount = Math.abs(tx.amount);\n  savingsByMonth[month] = r((savingsByMonth[month] || 0) + amount);\n}\n\nconst savingsMean = meanOfObject(savingsByMonth);\n\n\n// ===================\n// STEP 5: BUILD OUTPUT\n// ===================\n\n// Income side (same structure as V1, so V2 analytics engine can read it)\nconst incomeOutput = {};\nfor (const category of Object.keys(incomeByCategory)) {\n  incomeOutput[category] = incomeByCategory[category];\n}\nincomeOutput[\"OVERALL\"] = OVERALL_INCOME;\n\nreturn [\n  {\n    json: {\n      // === INCOME (V1-compatible structure) ===\n      ...incomeOutput,\n\n      // === EXPENSES (NEW in V2) ===\n      expenses: {\n        categories: expenseByCategory,\n        monthlyTotals: overallMonthlyExpense,\n        byType: {\n          FIXED: monthlyByType.FIXED,\n          ESSENTIAL: monthlyByType.ESSENTIAL,\n          DISCRETIONARY: monthlyByType.DISCRETIONARY,\n          DEBT: monthlyByType.DEBT,\n          INVESTIGATE: monthlyByType.INVESTIGATE\n        },\n        summary: {\n          totalMonthlyBurn: totalMonthlyBurn,\n          fixedMonthly: fixedMonthly,\n          essentialMonthly: essentialMonthly,\n          discretionaryMonthly: discretionaryMonthly,\n          debtMonthly: debtMonthly,\n          investigateMonthly: investigateMonthly,\n          fixedExpenseRatio: fixedExpenseRatio\n        }\n      },\n\n      // === SAVINGS (NEW in V2) ===\n      savings: {\n        monthlyInvestment: savingsByMonth,\n        meanMonthly: savingsMean\n      }\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1888,
+        160
+      ],
+      "id": "2d51d16a-53de-459d-a14c-94b107d960a2",
+      "name": "aggregation"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CHECK CONFIDENCE — Human-in-the-Loop Gate\n// ============================================================\n// Scans ALL classified transactions across ALL bank statements.\n// If ANY transaction triggers a review condition, sets\n// hitlRequired = true and collects flagged items for human\n// review before analytics proceed.\n//\n// FIVE HITL TRIGGERS:\n// 1. Low AI confidence (classificationConfidence < 0.7)\n// 2. Unidentifiable income spike (large CREDIT from unknown source)\n// 3. Large unclassified credit (category \"OTHER\" + amount > $200)\n// 4. Parse failure (zero amount or zero balance on multiple txns)\n// 5. Large P2P transfer (Zelle/Venmo/CashApp credit > $1,000)\n//\n// INPUT:  Output from filterTransactions node (multiple items,\n//         each with incomeTransactions, expenseTransactions,\n//         savingsTransactions, investigateTransactions,\n//         excludedTransactions)\n//\n// OUTPUT: Single item containing:\n//         - hitlRequired (boolean)\n//         - resumeUrl (only if hitlRequired — N8N Wait node resume endpoint)\n//         - flaggedTransactions (array of items needing review)\n//         - allTransactions (full flat list for frontend)\n//         - reviewSummary (counts by trigger type)\n//         - categoryOptions (dropdown options for review form)\n//\n// PLACEMENT: After filterTransactions, before IF → Respond to Webhook\n//            (Phase 1 endpoint)\n// ============================================================\n\n\n// ===================\n// CONFIGURATION\n// ===================\n\nconst CONFIDENCE_THRESHOLD = 0.7;\nconst SPIKE_MULTIPLIER = 0.2;           // Flag if amount > 2× overall monthly mean\nconst LARGE_OTHER_THRESHOLD = 200;      // Flag \"OTHER\" credits above this amount\nconst ZERO_BALANCE_MIN_COUNT = 2;       // Flag if this many+ txns have zero balance\nconst P2P_THRESHOLD = 100;             // Flag Zelle/Venmo/CashApp credits above this\n\n// Known income sources — if a CREDIT spike comes from one of these,\n// it's likely legitimate (even if large). We only flag spikes from\n// UNKNOWN sources where we can't identify the payer.\nconst KNOWN_SOURCE_KEYWORDS = new Set([\n  \"payroll\", \"salary\", \"wages\",\n  \"doordash\", \"uber\", \"lyft\", \"instacart\", \"grubhub\", \"postmates\",\n  \"fiverr\", \"upwork\", \"toptal\", \"freelancer\",\n  \"stripe\", \"paypal\", \"venmo\", \"zelle\", \"square\", \"cashapp\",\n  \"youtube\", \"twitch\", \"tiktok\", \"patreon\", \"substack\",\n  \"etsy\", \"shopify\", \"amazon seller\", \"ebay\",\n  \"airbnb\", \"vrbo\",\n  \"dividend\", \"interest\", \"pension\", \"social security\",\n  \"rental\", \"tenant\"\n]);\n\n// P2P payment platforms — transfers from individuals, not businesses.\n// Large amounts from these need verification: could be gifts, personal\n// loans, or non-income deposits that inflate projections.\nconst P2P_KEYWORDS = [\"zelle\", \"venmo\", \"cashapp\", \"cash app\"];\n\n\n// ===================\n// CATEGORY OPTIONS — for the review form dropdowns\n// ===================\n// Frontend shows CREDIT categories if direction is CREDIT,\n// DEBIT categories if direction is DEBIT.\n\nconst CREDIT_CATEGORIES = [\n  \"SALARY\",\n  \"GIG_INCOME\",\n  \"FREELANCE_INCOME\",\n  \"PENSION\",\n  \"RENTAL_INCOME\",\n  \"INTEREST\",\n  \"DIVIDEND\",\n  \"BUSINESS_INCOME\"\n];\n\nconst DEBIT_CATEGORIES = [\n  \"RENT\",\n  \"MORTGAGE\",\n  \"UTILITIES\",\n  \"BILL_PAYMENT\",\n  \"GROCERIES\",\n  \"DINING\",\n  \"SHOPPING\",\n  \"TRANSPORT\",\n  \"FUEL\",\n  \"INSURANCE\",\n  \"HEALTHCARE\",\n  \"EDUCATION\",\n  \"ENTERTAINMENT\",\n  \"SUBSCRIPTION\",\n  \"LOAN_PAYMENT\",\n  \"TAX\",\n  \"INVESTMENT\",\n  \"CASH_WITHDRAWAL\",\n  \"ATM\",\n  \"TRANSFER\",\n  \"FEES\",\n  \"CHARITY\",\n  \"TRAVEL\",\n  \"OTHER\"\n];\n\n// Available for both directions (user can reclassify as these)\nconst EITHER_DIRECTION = [\n  \"INTERNAL_TRANSFER\",\n  \"REFUND\"\n];\n\n\n// ===================\n// HELPER: Check if source is identifiable\n// ===================\nfunction isKnownSource(source, description) {\n  if (!source && !description) return false;\n\n  const text = `${source || \"\"} ${description || \"\"}`.toLowerCase();\n\n  for (const keyword of KNOWN_SOURCE_KEYWORDS) {\n    if (text.includes(keyword)) return true;\n  }\n\n  return false;\n}\n\n\n// ===================\n// STEP 1: FLATTEN ALL TRANSACTIONS + COMPUTE MONTHLY INCOME\n// ===================\n\nconst allItems = $input.all();\nconst flaggedTransactions = [];\nconst allTransactions = [];\n\n// We need overall monthly income to detect spikes\n// Compute it in a first pass before flagging\nconst monthlyIncomeMap = {};\n\nfor (let itemIdx = 0; itemIdx < allItems.length; itemIdx++) {\n  const data = allItems[itemIdx].json;\n  const incomeTxns = data.incomeTransactions || [];\n\n  for (const tx of incomeTxns) {\n    const month = tx.date ? tx.date.slice(0, 7) : \"unknown\";\n    const amount = Math.abs(tx.amount || 0);\n    monthlyIncomeMap[month] = (monthlyIncomeMap[month] || 0) + amount;\n  }\n}\n\n// Compute overall monthly mean income (for spike detection)\nconst monthlyIncomeValues = Object.values(monthlyIncomeMap);\nconst overallMonthlyMeanIncome = monthlyIncomeValues.length > 0\n  ? monthlyIncomeValues.reduce((a, b) => a + b, 0) / monthlyIncomeValues.length\n  : 0;\n\n// Track zero-balance counts per item (for parse failure detection)\nconst zeroBalanceCounts = [];\n\n\n// ===================\n// STEP 2: SCAN ALL TRANSACTIONS — APPLY ALL 5 TRIGGERS\n// ===================\n\nlet txIndex = 0;\n\n// Track flag reasons for summary\nlet lowConfidenceCount = 0;\nlet spikeCount = 0;\nlet largeOtherCount = 0;\nlet parseFailureCount = 0;\nlet largeP2PCount = 0;\n\nfor (let itemIdx = 0; itemIdx < allItems.length; itemIdx++) {\n  const data = allItems[itemIdx].json;\n\n  // Define which arrays to scan\n  // Each array came from filterTransactions with a specific role\n  const transactionArrays = [\n    { arrayName: \"incomeTransactions\",      transactions: data.incomeTransactions || [] },\n    { arrayName: \"expenseTransactions\",     transactions: data.expenseTransactions || [] },\n    { arrayName: \"savingsTransactions\",     transactions: data.savingsTransactions || [] },\n    { arrayName: \"investigateTransactions\", transactions: data.investigateTransactions || [] },\n    { arrayName: \"excludedTransactions\",    transactions: data.excludedTransactions || [] }\n  ];\n\n  let zeroBalanceInThisItem = 0;\n\n  for (const { arrayName, transactions } of transactionArrays) {\n    for (const tx of transactions) {\n      const confidence = tx.classificationConfidence ?? 1;\n      const amount = Math.abs(tx.amount || 0);\n      const balance = tx.balance;\n      const direction = tx.direction;\n      const category = tx.transactionCategory;\n      const description = tx.description || \"\";\n\n      // -------------------------------------------------------\n      // TRIGGER 1: Low AI confidence\n      // -------------------------------------------------------\n      const isLowConfidence = confidence < CONFIDENCE_THRESHOLD;\n\n      // -------------------------------------------------------\n      // TRIGGER 2: Unidentifiable income spike\n      // A CREDIT transaction that is:\n      //   - More than 2× overall monthly mean income\n      //   - From an unknown/unidentifiable source\n      //   - Not a salary (salaries can legitimately be large)\n      // This catches gifts, loans, one-time windfalls that\n      // inflate income projections\n      // -------------------------------------------------------\n      const isUnknownSpike =\n        direction === \"CREDIT\" &&\n        amount > 0 &&\n        overallMonthlyMeanIncome > 0 &&\n        amount > (overallMonthlyMeanIncome * SPIKE_MULTIPLIER) &&\n        category !== \"SALARY\" &&\n        !isKnownSource(tx.source, description);\n\n      // -------------------------------------------------------\n      // TRIGGER 3: Large unclassified credit\n      // AI tagged it \"OTHER\" and it's a material amount.\n      // Could be income, could be a gift, could be a refund.\n      // Human must decide.\n      // -------------------------------------------------------\n      const isLargeOther =\n        direction === \"CREDIT\" &&\n        category === \"OTHER\" &&\n        amount > LARGE_OTHER_THRESHOLD;\n\n      // -------------------------------------------------------\n      // TRIGGER 4: Parse failure indicators\n      // Zero amount suggests Gemini failed to extract properly.\n      // -------------------------------------------------------\n      const isZeroAmount = amount === 0;\n      if (balance === 0 || balance === null || balance === undefined) {\n        //zeroBalanceInThisItem++;\n      }\n\n      // -------------------------------------------------------\n      // TRIGGER 5: Large P2P transfer\n      // Zelle/Venmo/CashApp credits over $1,000 from individuals.\n      // These are NOT income — could be gifts, personal loans,\n      // or non-income deposits that inflate projections.\n      // Even if \"zelle\" is a known keyword for spike detection,\n      // P2P transfers from individuals need separate verification.\n      // -------------------------------------------------------\n      const isLargeP2P =\n        direction === \"CREDIT\" &&\n        amount >= P2P_THRESHOLD &&\n        P2P_KEYWORDS.some(kw => description.toLowerCase().includes(kw));\n\n      // -------------------------------------------------------\n      // AUTO-FLAG: Investigate-routed credits\n      // filterTransactions already said \"I don't know what this is.\"\n      // If it's money coming IN and we can't classify it,\n      // the human MUST review it. No threshold. No source matching.\n      // -------------------------------------------------------\n      const isInvestigateCredit =\n        arrayName === \"investigateTransactions\" &&\n        direction === \"CREDIT\";\n\n      // Determine if this transaction is flagged (any trigger)\n      const isFlagged = isLowConfidence || isUnknownSpike || isLargeOther || isZeroAmount || isLargeP2P || isInvestigateCredit;\n\n      // Build flag reasons array (a transaction can trigger multiple)\n      const flagReasons = [];\n\n      if (isLowConfidence) {\n        flagReasons.push({\n          trigger: \"LOW_CONFIDENCE\",\n          detail: `AI confidence ${(confidence * 100).toFixed(0)}% is below ${CONFIDENCE_THRESHOLD * 100}% threshold`\n        });\n        lowConfidenceCount++;\n      }\n\n      if (isUnknownSpike) {\n        flagReasons.push({\n          trigger: \"UNIDENTIFIABLE_SPIKE\",\n          detail: `$${amount.toLocaleString()} from unrecognized source \"${tx.source || description}\" is ${(amount / overallMonthlyMeanIncome).toFixed(1)}× the monthly income average. Could be a gift, loan, or one-time payment.`\n        });\n        spikeCount++;\n      }\n\n      if (isLargeOther) {\n        flagReasons.push({\n          trigger: \"LARGE_UNCLASSIFIED_CREDIT\",\n          detail: `$${amount.toLocaleString()} credit classified as \"OTHER\" — AI couldn't determine the source. Human must classify.`\n        });\n        largeOtherCount++;\n      }\n\n      if (isLargeP2P) {\n        flagReasons.push({\n          trigger: \"LARGE_P2P_TRANSFER\",\n          detail: `$${amount.toLocaleString()} received via peer-to-peer transfer from \"${description}\". P2P transfers over $${P2P_THRESHOLD.toLocaleString()} require verification — could be a personal loan, gift, or non-income deposit that inflates projections.`\n        });\n        largeP2PCount++;\n      }\n\n      if (isInvestigateCredit && !isLowConfidence && !isUnknownSpike && !isLargeOther && !isLargeP2P) {\n        // Only add this reason if no other trigger already caught it\n        // Avoids duplicate flagging — if it's already flagged as a spike\n        // or P2P, we don't need to also say \"unclassified credit\"\n        flagReasons.push({\n          trigger: \"UNCLASSIFIED_CREDIT\",\n          detail: `Credit of $${amount.toLocaleString()} from \"${description}\" could not be classified as income. The AI routed it for investigation. Human must determine if this is income, a transfer, a gift, or should be excluded.`\n        });\n      }\n\n      /*if (isZeroAmount) {\n        flagReasons.push({\n          trigger: \"PARSE_FAILURE\",\n          detail: `Transaction has $0 amount — likely a document extraction error.`\n        });\n        parseFailureCount++;\n      }*/\n\n      // Build enriched transaction record\n      const enrichedTx = {\n        _id: txIndex++,\n        _itemIndex: itemIdx,\n        _sourceArray: arrayName,\n        date: tx.date,\n        description: tx.description,\n        direction: tx.direction,\n        amount: tx.amount,\n        balance: tx.balance || null,\n        source: tx.source || null,\n        transactionCategory: tx.transactionCategory,\n        classificationConfidence: confidence,\n        expenseType: tx.expenseType || null,\n        routeType: tx.routeType || null,\n        flagged: isFlagged,\n        flagReasons: isFlagged ? flagReasons : [],\n        humanReviewed: false,\n        ignored: false\n      };\n\n      allTransactions.push(enrichedTx);\n\n      if (isFlagged) {\n        flaggedTransactions.push(enrichedTx);\n      }\n    }\n  }\n\n  zeroBalanceCounts.push(zeroBalanceInThisItem);\n}\n\n\n// ===================\n// BUILD OUTPUT\n// ===================\n\nconst hitlRequired = flaggedTransactions.length > 0;\n\n// Base output — always present\nconst output = {\n  // === HITL Decision ===\n  hitlRequired: hitlRequired,\n\n  // === Review Summary ===\n  reviewSummary: {\n    totalTransactions: allTransactions.length,\n    flaggedCount: flaggedTransactions.length,\n    confidenceThreshold: CONFIDENCE_THRESHOLD,\n    // Breakdown by trigger type\n    triggerCounts: {\n      lowConfidence: lowConfidenceCount,\n      unidentifiableSpike: spikeCount,\n      largeUnclassifiedCredit: largeOtherCount,\n      parseFailure: parseFailureCount,\n      largeP2P: largeP2PCount\n    },\n    message: hitlRequired\n      ? `${flaggedTransactions.length} transaction(s) flagged for review. Breakdown: ${lowConfidenceCount} low confidence, ${spikeCount} unidentifiable spike(s), ${largeOtherCount} large unclassified credit(s), ${largeP2PCount} large P2P transfer(s), ${parseFailureCount} parse failure(s).`\n      : `All ${allTransactions.length} transactions passed confidence and quality checks.`\n  },\n\n  // === Flagged Transactions (for review form) ===\n  flaggedTransactions: flaggedTransactions,\n\n  // === ALL Transactions (frontend holds these) ===\n  allTransactions: allTransactions,\n\n  // === Category Options (for review form dropdowns) ===\n  categoryOptions: {\n    CREDIT: [...CREDIT_CATEGORIES, ...EITHER_DIRECTION],\n    DEBIT: [...DEBIT_CATEGORIES, ...EITHER_DIRECTION]\n  },\n\n  // === Pass through metadata ===\n  metadata: {\n    itemCount: allItems.length,\n    documentMonths: allItems.map(item => item.json.documentMonth).filter(Boolean),\n    overallMonthlyMeanIncome: Number(overallMonthlyMeanIncome.toFixed(2)),\n    spikeThreshold: Number((overallMonthlyMeanIncome * SPIKE_MULTIPLIER).toFixed(2))\n  }\n};\n\n// === Resume URL — ONLY when HITL is required ===\nif (hitlRequired) {\n  output.resumeUrl = $execution.resumeUrl;\n}\n\nreturn [{ json: output }];\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        416
+      ],
+      "id": "fcf5ed5a-c33a-4ad7-9f33-6e0f084eeb8e",
+      "name": "CheckLowConfEntries"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "b88f76e3-11fc-43b8-9567-8a0e6ead5763",
+              "leftValue": "={{ $json.hitlRequired }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1184,
+        416
+      ],
+      "id": "3f79859b-2ff4-4c63-862f-0fca2eb6e2f2",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1568,
+        432
+      ],
+      "id": "bfa00457-5c3b-4dd3-83ec-d8f452b3c67d",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2048,
+        432
+      ],
+      "id": "3da6dcf4-abc3-4535-b072-a2798969c2b8",
+      "name": "Wait",
+      "webhookId": "8d059201-9715-4fa3-a7c2-ff5b39a14f49"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// ERROR HANDLER — Catch & Return Clean Error Response\n// ============================================================\n// Connect this to the ERROR output of any node.\n// Instead of the workflow crashing, it captures the error\n// and returns a structured response the frontend can display.\n//\n// WIRING: Node (Error output) → this node → Respond to Webhook\n// ============================================================\n\nconst errorData = $input.all();\n\n// N8N passes error info differently depending on the node type\nconst firstItem = errorData[0] || {};\nconst json = firstItem.json || {};\n\n// Try to extract error details from various N8N error formats\nconst errorMessage =\n  json.error?.message ||\n  json.errorMessage ||\n  json.message ||\n  json.error ||\n  \"An unknown error occurred during processing.\";\n\nconst errorDescription =\n  json.error?.description ||\n  json.errorDescription ||\n  json.description ||\n  null;\n\n// Which node failed?\nconst failedNode =\n  json.error?.node ||\n  json.nodeName ||\n  json.error?.name ||\n  \"Unknown node\";\n\n// Stack trace (for debugging — don't show to end users)\nconst stackTrace =\n  json.error?.stack ||\n  json.stack ||\n  json.n8nDetails?.stackTrace ||\n  null;\n\nreturn [\n  {\n    json: {\n      success: false,\n      error: {\n        message: errorMessage,\n        description: errorDescription,\n        failedNode: failedNode,\n        // Include for debugging — remove in production\n        debug: stackTrace ? { stackTrace: stackTrace } : null\n      },\n      // So the frontend knows this is an error, not a result\n      hitlRequired: false,\n      isError: true\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        624
+      ],
+      "id": "5ef0ee33-b497-4004-8bbc-88f54b2878b5",
+      "name": "returnErrorDetails"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// ERROR HANDLER — Catch & Return Clean Error Response\n// ============================================================\n// Connect this to the ERROR output of any node.\n// Instead of the workflow crashing, it captures the error\n// and returns a structured response the frontend can display.\n//\n// WIRING: Node (Error output) → this node → Respond to Webhook\n// ============================================================\n\nconst errorData = $input.all();\n\n// N8N passes error info differently depending on the node type\nconst firstItem = errorData[0] || {};\nconst json = firstItem.json || {};\n\n// Try to extract error details from various N8N error formats\nconst errorMessage =\n  json.error?.message ||\n  json.errorMessage ||\n  json.message ||\n  json.error ||\n  \"An unknown error occurred during processing.\";\n\nconst errorDescription =\n  json.error?.description ||\n  json.errorDescription ||\n  json.description ||\n  null;\n\n// Which node failed?\nconst failedNode =\n  json.error?.node ||\n  json.nodeName ||\n  json.error?.name ||\n  \"Unknown node\";\n\n// Stack trace (for debugging — don't show to end users)\nconst stackTrace =\n  json.error?.stack ||\n  json.stack ||\n  json.n8nDetails?.stackTrace ||\n  null;\n\nreturn [\n  {\n    json: {\n      success: false,\n      error: {\n        message: errorMessage,\n        description: errorDescription,\n        failedNode: failedNode,\n        // Include for debugging — remove in production\n        debug: stackTrace ? { stackTrace: stackTrace } : null\n      },\n      // So the frontend knows this is an error, not a result\n      hitlRequired: false,\n      isError: true\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -16
+      ],
+      "id": "905718fe-8500-4da3-8d29-ab726d80e14a",
+      "name": "returnErrorDetails1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CLEAN BINARY — Remove non-document files\n// ============================================================\n// Strips any binary attachment with MIME type application/octet-stream\n// Place AFTER base64_to_binary, BEFORE classify_bankStatements\n// ============================================================\n\nconst output = [];\n\nfor (const item of $input.all()) {\n  if (!item.binary) {\n    output.push(item);\n    continue;\n  }\n\n  const cleanBinary = {};\n  let kept = 0;\n\n  for (const [key, file] of Object.entries(item.binary)) {\n    if (file.mimeType === 'application/octet-stream') {\n      console.log(`Removed: ${file.fileName || key} (${file.mimeType})`);\n      continue;\n    }\n    cleanBinary[key] = file;\n    kept++;\n  }\n\n  // Only include the item if it still has at least one valid file\n  if (kept > 0) {\n    output.push({ json: item.json, binary: cleanBinary });\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        432
+      ],
+      "id": "42d93bef-b090-4ae3-b955-68ef6a0d9f49",
+      "name": "filterOutMetadaData"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $json;\nconst streams = Object.keys(d.incomeStreams || {}).length;\nconst assessment = d.underwriting?.assessment || \"REVIEW\";\nconst months = d.dataConfidence?.monthsAnalyzed || 0;\nconst flags = (d.redFlags || []).length;\n\nconst strength = d.cashFlow?.savingsRate > 50 \n  ? \"Strong savings rate with stable recurring income\"\n  : \"Multi-stream income with diversified sources\";\n\nconst concern = months < 6 \n  ? `only ${months} months of data (12-24 recommended)`\n  : flags > 2 \n  ? `${flags} red flags requiring manual verification`\n  : \"limited data history\";\n\nreturn [{\n  json: {\n    ...d,\n    shortNarrative: `${strength}, but ${concern}.`\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2304,
+        160
+      ],
+      "id": "73b3a6cd-8158-4015-a7f7-b27179d1a064",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\n\n// After Wait resumes, N8N gives us the raw webhook request\n// The frontend's POST body is in input.body\nif (input.body && input.body.allTransactions) {\n  return [{ json: { allTransactions: input.body.allTransactions } }];\n}\n\n// Fallback: original allTransactions\nif (input.allTransactions) {\n  return [{ json: { allTransactions: input.allTransactions } }];\n}\n\nthrow new Error(\"No transactions found. Keys: \" + Object.keys(input).join(\", \"));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        432
+      ],
+      "id": "5b271a7c-096b-45db-bd94-ad8cb712fdaf",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2416,
+        -32
+      ],
+      "id": "8a313de4-ad76-484f-a1f9-8e4585e1ab37",
+      "name": "Respond to Webhook2"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// V2 INCOME FLOW ANALYZER — ENHANCED ANALYTICS ENGINE\n// ============================================================\n// Replaces the V1 underwriting node (\"Code in JavaScript\")\n// \n// INPUT:  V2 aggregation output — income by category × month\n//         with meanMonthlyIncome and projectedAnnualIncome\n//         PLUS expenses by category × month, typed as\n//         FIXED / ESSENTIAL / DISCRETIONARY / DEBT / INVESTIGATE\n//         PLUS savings (INVESTMENT) tracking\n//\n// OUTPUT: Full V2 analytics JSON with:\n//         - Per-stream stability (CV), recurrence, consistency\n//         - Overall stability\n//         - Diversification (HHI)\n//         - Red flag detection\n//         - Sustainable income (floor-weighted)\n//         - Expense analysis (burn rate, fixed vs discretionary)\n//         - Balance buffer analysis (reserves, runway)\n//         - Cash flow (residual income, savings rate)\n//         - Debt analysis (DTI proxy, DTI with new loan)\n//         - Composite underwriting score\n//         - Data confidence indicator\n//         - AI-ready narrative string\n// ============================================================\n\n\n// ===================\n// STEP 0: CONFIGURATION\n// ===================\n// Thresholds are product design decisions, not regulatory prescriptions.\n// CV thresholds based on statistical convention for interpreting dispersion.\n// DTI thresholds ARE industry-prescribed (Fannie Mae, FHA, Non-QM).\n\nconst STABILITY_THRESHOLDS = [\n  { max: 5,        grade: \"A\", label: \"Stable\",   color: \"#22C55E\" },\n  { max: 15,       grade: \"B\", label: \"Moderate\",  color: \"#3B82F6\" },\n  { max: 30,       grade: \"C\", label: \"Variable\",  color: \"#EAB308\" },\n  { max: Infinity, grade: \"D\", label: \"Volatile\",  color: \"#EF4444\" }\n];\n\nconst HHI_THRESHOLDS = [\n  { max: 0.25, label: \"Well-Diversified\" },\n  { max: 0.50, label: \"Moderate\" },\n  { max: 1.00, label: \"Concentrated\" }\n];\n\n// DTI thresholds — these ARE industry-prescribed\n// Fannie Mae: 36% preferred, 45% max\n// FHA: 43% standard, 50% with compensating factors\n// Non-QM: up to 50%, varies by lender\nconst DTI_THRESHOLDS = [\n  { max: 36,       grade: \"STRONG\",   label: \"Within conventional preferred limit (Fannie Mae < 36%)\" },\n  { max: 43,       grade: \"ACCEPTABLE\", label: \"Within FHA standard limit (< 43%)\" },\n  { max: 50,       grade: \"ELEVATED\",  label: \"At Non-QM upper range (< 50%)\" },\n  { max: Infinity, grade: \"HIGH_RISK\", label: \"Exceeds standard DTI thresholds (> 50%)\" }\n];\n\n// Balance runway thresholds\n// Non-QM lenders typically require 3-6 months of reserves\nconst RUNWAY_THRESHOLDS = [\n  { min: 6,  grade: \"STRONG\",   label: \"6+ months of expenses in reserve\" },\n  { min: 3,  grade: \"ADEQUATE\", label: \"3–6 months of expenses in reserve\" },\n  { min: 1,  grade: \"THIN\",     label: \"1–3 months of expenses in reserve\" },\n  { min: 0,  grade: \"CRITICAL\", label: \"Less than 1 month of expenses in reserve\" }\n];\n\n// Balance trend thresholds\nconst TREND_THRESHOLDS = [\n  { min: 10,          grade: \"BUILDING\",  label: \"Reserves growing\" },\n  { min: -10,         grade: \"STABLE\",    label: \"Reserves roughly stable\" },\n  { min: -30,         grade: \"DECLINING\",  label: \"Reserves decreasing\" },\n  { min: -Infinity,   grade: \"DEPLETING\", label: \"Reserves rapidly depleting\" }\n];\n\n// Composite score weights\nconst WEIGHTS = {\n  loanToIncome:     0.20,   // Can they afford it? (reduced from 0.30 — DTI now handles affordability)\n  stability:        0.20,   // Is the income reliable?\n  recurrence:       0.10,   // Does it show up every month?\n  diversification:  0.10,   // Single-source risk?\n  redFlags:         0.10,   // Any warning signs?\n  dti:              0.15,   // Debt burden — industry-standard measure\n  residualIncome:   0.15    // What's left after ALL obligations?\n};\n\n// Assessment tiers based on composite score\nconst ASSESSMENT_TIERS = [\n  { min: 80,  label: \"STRONG\",     color: \"#22C55E\" },\n  { min: 65,  label: \"REASONABLE\", color: \"#3B82F6\" },\n  { min: 45,  label: \"REVIEW\",     color: \"#EAB308\" },\n  { min: 0,   label: \"HIGH_RISK\",  color: \"#EF4444\" }\n];\n\n\n// ===================\n// STEP 1: EXTRACT INPUT DATA\n// ===================\n\nconst income = $input.all()[0].json;\n\nconst rawLoanAmount = $('Webhook').first().json.webhookUrl;\nif (!rawLoanAmount) {\n  throw new Error('Loan amount is required but was not provided.');\n}\n\nconst loanAmount = Number(rawLoanAmount);\n\n// Separate income streams from OVERALL and from expense data\nconst expensesData = income.expenses || {};\nconst savingsData = income.savings || {};\nconst streamNames = Object.keys(income).filter(\n  k => k !== \"OVERALL\" && k !== \"expenses\" && k !== \"savings\"\n);\nconst overallData = income.OVERALL;\n\n// Determine the full set of months across all streams\nconst allMonths = new Set();\nfor (const name of streamNames) {\n  for (const month of Object.keys(income[name].monthlyIncome)) {\n    allMonths.add(month);\n  }\n}\nconst sortedMonths = Array.from(allMonths).sort();\nconst totalMonths = sortedMonths.length;\n\n\n// ===================\n// STEP 2: HELPER FUNCTIONS\n// ===================\n\n/**\n * Compute Coefficient of Variation (CV)\n * CV = (standard deviation / mean) × 100\n * Measures volatility — how much a value swings month to month.\n * Basis: Standard statistical measure. Quantifies what Fannie Mae B3-3.1\n * requires qualitatively: \"income must be stable and likely to continue\"\n */\nfunction computeCV(values) {\n  if (values.length < 2) return 0;\n  const mean = values.reduce((a, b) => a + b, 0) / values.length;\n  if (mean === 0) return 0;\n  const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;\n  const stdDev = Math.sqrt(variance);\n  return Number(((stdDev / mean) * 100).toFixed(2));\n}\n\n/**\n * Map CV value to stability grade\n */\nfunction getStabilityGrade(cv) {\n  for (const tier of STABILITY_THRESHOLDS) {\n    if (cv < tier.max) return { grade: tier.grade, label: tier.label, color: tier.color };\n  }\n  return STABILITY_THRESHOLDS[STABILITY_THRESHOLDS.length - 1];\n}\n\n/**\n * Map HHI value to diversification label\n */\nfunction getHHILabel(hhi) {\n  for (const tier of HHI_THRESHOLDS) {\n    if (hhi <= tier.max) return tier.label;\n  }\n  return \"Concentrated\";\n}\n\n/**\n * Map DTI to grade — these thresholds ARE industry-prescribed\n */\nfunction getDTIGrade(dti) {\n  for (const tier of DTI_THRESHOLDS) {\n    if (dti < tier.max) return { grade: tier.grade, label: tier.label };\n  }\n  return DTI_THRESHOLDS[DTI_THRESHOLDS.length - 1];\n}\n\n/**\n * Map composite score to assessment tier\n */\nfunction getAssessment(score) {\n  for (const tier of ASSESSMENT_TIERS) {\n    if (score >= tier.min) return { label: tier.label, color: tier.color };\n  }\n  return ASSESSMENT_TIERS[ASSESSMENT_TIERS.length - 1];\n}\n\n/**\n * Map balance runway to grade\n */\nfunction getRunwayGrade(months) {\n  for (const tier of RUNWAY_THRESHOLDS) {\n    if (months >= tier.min) return { grade: tier.grade, label: tier.label };\n  }\n  return RUNWAY_THRESHOLDS[RUNWAY_THRESHOLDS.length - 1];\n}\n\n/**\n * Map balance trend to grade\n */\nfunction getTrendGrade(changePercent) {\n  for (const tier of TREND_THRESHOLDS) {\n    if (changePercent >= tier.min) return { grade: tier.grade, label: tier.label };\n  }\n  return TREND_THRESHOLDS[TREND_THRESHOLDS.length - 1];\n}\n\n\n// ===================\n// STEP 3: PER-STREAM INCOME ANALYTICS\n// ===================\n// For each income stream:\n//   - Stability (CV + grade)\n//   - Recurrence (months present / total months)\n//   - Consistency (min, max, band = (max-min)/mean)\n\nconst incomeStreams = {};\n\nfor (const name of streamNames) {\n  const stream = income[name];\n  const monthlyValues = Object.values(stream.monthlyIncome);\n  const monthlyKeys = Object.keys(stream.monthlyIncome);\n\n  // 3a: Stability (CV)\n  const cv = computeCV(monthlyValues);\n  const stabilityGrade = getStabilityGrade(cv);\n\n  // 3b: Recurrence\n  const monthsPresent = monthlyKeys.length;\n  const recurrenceRate = Number((monthsPresent / totalMonths).toFixed(2));\n\n  // 3c: Consistency\n  const min = Math.min(...monthlyValues);\n  const max = Math.max(...monthlyValues);\n  const mean = stream.meanMonthlyIncome;\n  const band = mean > 0 ? Number(((max - min) / mean).toFixed(3)) : 0;\n\n  incomeStreams[name] = {\n    monthlyIncome: stream.monthlyIncome,\n    meanMonthlyIncome: mean,\n    projectedAnnualIncome: stream.projectedAnnualIncome,\n    stability: {\n      cv: cv,\n      grade: stabilityGrade.grade,\n      label: stabilityGrade.label\n    },\n    recurrence: {\n      monthsPresent: monthsPresent,\n      totalMonths: totalMonths,\n      rate: recurrenceRate\n    },\n    consistency: {\n      min: min,\n      max: max,\n      band: band\n    }\n  };\n}\n\n\n// ===================\n// STEP 4: OVERALL INCOME STABILITY\n// ===================\n\nconst overallMonthlyValues = Object.values(overallData.monthlyIncome);\nconst overallCV = computeCV(overallMonthlyValues);\nconst overallStability = getStabilityGrade(overallCV);\n\nconst overall = {\n  monthlyIncome: overallData.monthlyIncome,\n  meanMonthlyIncome: overallData.meanMonthlyIncome,\n  projectedAnnualIncome: overallData.projectedAnnualIncome,\n  stability: {\n    cv: overallCV,\n    grade: overallStability.grade,\n    label: overallStability.label\n  },\n  totalMonths: totalMonths,\n  streamCount: streamNames.length\n};\n\n\n// ===================\n// STEP 5: DIVERSIFICATION (HHI)\n// ===================\n\nconst totalProjectedAnnual = overallData.projectedAnnualIncome;\nconst shares = {};\nlet hhi = 0;\n\nfor (const name of streamNames) {\n  const share = totalProjectedAnnual > 0\n    ? income[name].projectedAnnualIncome / totalProjectedAnnual\n    : 0;\n  shares[name] = Number(share.toFixed(3));\n  hhi += share * share;\n}\n\nhhi = Number(hhi.toFixed(3));\nconst hhiLabel = getHHILabel(hhi);\n\nconst diversification = {\n  hhi: hhi,\n  grade: hhiLabel,\n  shares: shares\n};\n\n\n// ===================\n// STEP 6: RED FLAG DETECTION\n// ===================\n// Domain-driven checks that a vibe coder wouldn't think of.\n// Each flag gets a type, severity, and plain-English explanation.\n\nconst redFlags = [];\n\nfor (const name of streamNames) {\n  const stream = income[name];\n  const monthlyValues = Object.values(stream.monthlyIncome);\n  const monthlyEntries = Object.entries(stream.monthlyIncome);\n  const mean = stream.meanMonthlyIncome;\n\n  // FLAG 1: Round-number deposits (common in fabricated statements)\n  for (const [month, amount] of monthlyEntries) {\n    if (amount >= 500 && amount % 100 === 0) {\n      redFlags.push({\n        type: \"ROUND_NUMBER_DEPOSIT\",\n        severity: \"WARNING\",\n        stream: name,\n        month: month,\n        amount: amount,\n        explanation: `Round-number deposit ($${amount.toLocaleString()}) in ${name.replace(/_/g, ' ').toLowerCase()}. Round deposits are a known indicator of fabricated statements and may warrant verification.`\n      });\n    }\n  }\n\n  // FLAG 2: One-time spike (single deposit > 3× the stream's monthly mean)\n  for (const [month, amount] of monthlyEntries) {\n    if (mean > 0 && amount > mean * 3) {\n      redFlags.push({\n        type: \"INCOME_SPIKE\",\n        severity: \"WARNING\",\n        stream: name,\n        month: month,\n        amount: amount,\n        explanation: `Unusually large deposit ($${amount.toLocaleString()}) in ${name.replace(/_/g, ' ').toLowerCase()} — ${(amount / mean).toFixed(1)}× the monthly average. One-time spikes inflate income projections unrealistically.`\n      });\n    }\n  }\n\n  // FLAG 3: Single-appearance stream (only 1 of N months)\n  if (monthlyValues.length === 1 && totalMonths > 1) {\n    redFlags.push({\n      type: \"SINGLE_APPEARANCE\",\n      severity: \"INFO\",\n      stream: name,\n      month: monthlyEntries[0][0],\n      amount: monthlyEntries[0][1],\n      explanation: `${name.replace(/_/g, ' ')} appeared in only 1 of ${totalMonths} months. Cannot establish recurrence — treat as one-time income.`\n    });\n  }\n\n  // FLAG 4: Missing months (stream present in some but not all months)\n  if (monthlyValues.length > 1 && monthlyValues.length < totalMonths) {\n    const presentMonths = new Set(Object.keys(stream.monthlyIncome));\n    const missingMonths = sortedMonths.filter(m => !presentMonths.has(m));\n    redFlags.push({\n      type: \"MISSING_MONTHS\",\n      severity: \"WARNING\",\n      stream: name,\n      month: missingMonths.join(\", \"),\n      amount: null,\n      explanation: `${name.replace(/_/g, ' ')} missing in ${missingMonths.join(\", \")}. Income may not be ongoing — verify with borrower.`\n    });\n  }\n}\n\n\n// ===================\n// STEP 7: SUSTAINABLE INCOME\n// ===================\n// Floor-weighted: use each stream's minimum month instead of mean.\n// This is stress-test thinking — what if next month = worst month?\n// Basis: Fannie Mae requires declining income to be underwritten\n// at the lower amount. We apply this per-stream.\n\nlet sustainableMonthly = 0;\nfor (const name of streamNames) {\n  const monthlyValues = Object.values(income[name].monthlyIncome);\n  const floorValue = Math.min(...monthlyValues);\n  sustainableMonthly += floorValue;\n}\n\nconst sustainableAnnual = sustainableMonthly * 12;\nconst projectedAnnual = overallData.projectedAnnualIncome;\nconst discountFromProjected = projectedAnnual > 0\n  ? Number((((projectedAnnual - sustainableAnnual) / projectedAnnual) * 100).toFixed(1))\n  : 0;\n\nconst sustainableIncome = {\n  monthlyFloorWeighted: Number(sustainableMonthly.toFixed(2)),\n  annualFloorWeighted: Number(sustainableAnnual.toFixed(2)),\n  discountFromProjected: discountFromProjected\n};\n\n\n// ===================\n// STEP 8: EXPENSE ANALYSIS\n// ===================\n// Process the expense data from the aggregation node.\n\nconst expSummary = expensesData.summary || {};\nconst expByType = expensesData.byType || {};\nconst expCategories = expensesData.categories || {};\n\n// 8a: Expense burn stability — is spending predictable?\nconst expMonthlyTotals = expensesData.monthlyTotals || {};\nconst expMonthlyValues = Object.values(expMonthlyTotals);\nconst burnCV = computeCV(expMonthlyValues);\nconst burnStability = getStabilityGrade(burnCV);\n\nconst totalMonthlyBurn = expSummary.totalMonthlyBurn || 0;\n\nconst expenses = {\n  categories: expCategories,\n  monthlyTotals: expMonthlyTotals,\n  byType: expByType,\n  summary: {\n    totalMonthlyBurn: totalMonthlyBurn,\n    fixedMonthly: expSummary.fixedMonthly || 0,\n    essentialMonthly: expSummary.essentialMonthly || 0,\n    discretionaryMonthly: expSummary.discretionaryMonthly || 0,\n    debtMonthly: expSummary.debtMonthly || 0,\n    investigateMonthly: expSummary.investigateMonthly || 0,\n    fixedExpenseRatio: expSummary.fixedExpenseRatio || 0,\n    burnStability: {\n      cv: burnCV,\n      grade: burnStability.grade,\n      label: burnStability.label\n    }\n  }\n};\n\n\n// ===================\n// STEP 8.5: BALANCE BUFFER ANALYSIS\n// ===================\n// Uses balance fields from transactions to assess:\n//   - Financial cushion (average, min, max balance)\n//   - Runway (how many months of expenses the min balance covers)\n//   - Trend (building reserves vs depleting)\n//\n// Industry basis: Non-QM lenders require 3-6 months of reserves.\n// Angel Oak, Deephaven, A&D Mortgage all document this.\n// This is the bank-statement equivalent of reserve verification.\n\n// Collect all balance data points from the checkConfidence node\n// which has the full flat transaction list. Fall back to filterTransactions.\nlet allTxForBalance = [];\n\ntry {\n  const checkConfData = $('checkConfidence').first().json;\n  if (checkConfData && checkConfData.allTransactions) {\n    allTxForBalance = checkConfData.allTransactions;\n  }\n} catch (e) {\n  // checkConfidence node not available — pull from filterTransactions\n  try {\n    const filterItems = $('filterTransactions').all();\n    for (const item of filterItems) {\n      const d = item.json;\n      const arrays = [\n        d.incomeTransactions || [],\n        d.expenseTransactions || [],\n        d.savingsTransactions || [],\n        d.investigateTransactions || [],\n        d.excludedTransactions || []\n      ];\n      for (const arr of arrays) {\n        allTxForBalance.push(...arr);\n      }\n    }\n  } catch (e2) {\n    // No balance data available\n  }\n}\n\n// Extract valid balance values (non-null, non-zero)\n// Zero balances likely indicate parse failures, not actual $0 balance\nconst balancePoints = [];\nfor (const tx of allTxForBalance) {\n  const bal = tx.balance ?? null;\n  if (bal !== null && bal !== undefined && bal > 0) {\n    balancePoints.push({\n      date: tx.date,\n      balance: bal\n    });\n  }\n}\n\n// Sort by date to get chronological order\nbalancePoints.sort((a, b) => a.date.localeCompare(b.date));\n\nlet balanceBuffer;\n\nif (balancePoints.length >= 2) {\n  const balanceValues = balancePoints.map(bp => bp.balance);\n\n  const avgBalance = Number(\n    (balanceValues.reduce((a, b) => a + b, 0) / balanceValues.length).toFixed(2)\n  );\n  const minBalance = Number(Math.min(...balanceValues).toFixed(2));\n  const maxBalance = Number(Math.max(...balanceValues).toFixed(2));\n\n  // Runway: how many months of expenses can they survive on their minimum balance?\n  const runwayMonths = totalMonthlyBurn > 0\n    ? Number((minBalance / totalMonthlyBurn).toFixed(1))\n    : null;\n\n  const runwayGradeResult = runwayMonths !== null\n    ? getRunwayGrade(runwayMonths)\n    : { grade: \"UNKNOWN\", label: \"Cannot calculate — no expense data\" };\n\n  // Trend: compare first and last balance\n  const startBalance = balancePoints[0].balance;\n  const endBalance = balancePoints[balancePoints.length - 1].balance;\n  const balanceChange = Number((endBalance - startBalance).toFixed(2));\n  const balanceChangePercent = startBalance > 0\n    ? Number(((balanceChange / startBalance) * 100).toFixed(1))\n    : 0;\n\n  const trendGradeResult = getTrendGrade(balanceChangePercent);\n\n  balanceBuffer = {\n    averageBalance: avgBalance,\n    minBalance: minBalance,\n    maxBalance: maxBalance,\n    balanceRunway: {\n      months: runwayMonths,\n      grade: runwayGradeResult.grade,\n      label: runwayGradeResult.label\n    },\n    balanceTrend: {\n      startBalance: startBalance,\n      endBalance: endBalance,\n      change: balanceChange,\n      changePercent: balanceChangePercent,\n      grade: trendGradeResult.grade,\n      label: trendGradeResult.label\n    },\n    dataPoints: balancePoints.length,\n    note: `Based on ${balancePoints.length} transaction balance snapshots across the analysis period.`\n  };\n\n  // RED FLAGS — Balance-specific\n  // Low balance: minimum balance covers less than 1 month of expenses\n  if (runwayMonths !== null && runwayMonths < 1) {\n    redFlags.push({\n      type: \"LOW_BALANCE\",\n      severity: \"WARNING\",\n      stream: \"BALANCE\",\n      month: balancePoints.find(bp => bp.balance === minBalance)?.date || \"unknown\",\n      amount: minBalance,\n      explanation: `Minimum account balance ($${minBalance.toLocaleString()}) covers only ${runwayMonths} months of expenses. Borrower has minimal financial cushion.`\n    });\n  }\n\n  // Depleting balance: balance dropped 20%+ over the period\n  if (balanceChangePercent <= -20) {\n    redFlags.push({\n      type: \"DEPLETING_BALANCE\",\n      severity: \"WARNING\",\n      stream: \"BALANCE\",\n      month: `${balancePoints[0].date} → ${balancePoints[balancePoints.length - 1].date}`,\n      amount: balanceChange,\n      explanation: `Account balance decreased ${Math.abs(balanceChangePercent)}% over the analysis period ($${startBalance.toLocaleString()} → $${endBalance.toLocaleString()}). Borrower may be depleting reserves.`\n    });\n  }\n\n} else {\n  // Not enough balance data\n  balanceBuffer = {\n    averageBalance: null,\n    minBalance: null,\n    maxBalance: null,\n    balanceRunway: {\n      months: null,\n      grade: \"INSUFFICIENT_DATA\",\n      label: \"Not enough balance data points to analyze\"\n    },\n    balanceTrend: {\n      startBalance: null,\n      endBalance: null,\n      change: null,\n      changePercent: null,\n      grade: \"INSUFFICIENT_DATA\",\n      label: \"Not enough balance data points to analyze\"\n    },\n    dataPoints: balancePoints.length,\n    note: \"Insufficient balance data for buffer analysis.\"\n  };\n}\n\n\n// ===================\n// STEP 9: CASH FLOW ANALYSIS\n// ===================\n// Residual income = income - expenses per month\n// This answers: \"After paying all bills, is there enough left?\"\n\nconst monthlyResidual = {};\nconst meanMonthlyIncome = overallData.meanMonthlyIncome;\n\nfor (const month of sortedMonths) {\n  const incomeVal = overallData.monthlyIncome[month] || 0;\n  const expenseVal = expMonthlyTotals[month] || 0;\n  monthlyResidual[month] = Number((incomeVal - expenseVal).toFixed(2));\n}\n\nconst residualValues = Object.values(monthlyResidual);\nconst meanResidual = residualValues.length > 0\n  ? Number((residualValues.reduce((a, b) => a + b, 0) / residualValues.length).toFixed(2))\n  : 0;\n\nconst residualCV = computeCV(residualValues.map(v => Math.max(v, 0)));\nconst residualStability = getStabilityGrade(residualCV);\n\n// Savings rate: what % of income is left after expenses?\nconst savingsRate = meanMonthlyIncome > 0\n  ? Number(((meanResidual / meanMonthlyIncome) * 100).toFixed(1))\n  : 0;\n\nconst cashFlow = {\n  monthlyResidual: monthlyResidual,\n  meanResidual: meanResidual,\n  residualStability: {\n    cv: residualCV,\n    grade: residualStability.grade,\n    label: residualStability.label\n  },\n  savingsRate: savingsRate\n};\n\n\n// ===================\n// STEP 10: DEBT ANALYSIS (DTI)\n// ===================\n// DTI = Monthly Debt Payments / Gross Monthly Income × 100\n// DTI Thresholds ARE industry-prescribed.\n\nconst identifiedDebtPayments = expSummary.debtMonthly || 0;\n\nconst estimatedDTI = meanMonthlyIncome > 0\n  ? Number(((identifiedDebtPayments / meanMonthlyIncome) * 100).toFixed(1))\n  : 0;\n\n// Estimate monthly payment for the new loan\n// Using simple annuity formula: PMT = P × [r(1+r)^n] / [(1+r)^n - 1]\n// Assumptions: 8% annual rate, 36-month term (personal loan defaults)\nconst annualRate = 0.08;\nconst monthlyRate = annualRate / 12;\nconst loanTermMonths = 36;\nconst estimatedNewLoanPayment = monthlyRate > 0\n  ? Number((loanAmount * (monthlyRate * Math.pow(1 + monthlyRate, loanTermMonths)) /\n    (Math.pow(1 + monthlyRate, loanTermMonths) - 1)).toFixed(2))\n  : Number((loanAmount / loanTermMonths).toFixed(2));\n\nconst dtiWithNewLoan = meanMonthlyIncome > 0\n  ? Number((((identifiedDebtPayments + estimatedNewLoanPayment) / meanMonthlyIncome) * 100).toFixed(1))\n  : 0;\n\nconst dtiGradeResult = getDTIGrade(dtiWithNewLoan);\n\nconst debtAnalysis = {\n  identifiedDebtPayments: identifiedDebtPayments,\n  estimatedDTI: estimatedDTI,\n  estimatedNewLoanMonthlyPayment: estimatedNewLoanPayment,\n  dtiWithNewLoan: dtiWithNewLoan,\n  dtiGrade: dtiGradeResult.grade,\n  dtiLabel: dtiGradeResult.label,\n  assumptions: {\n    annualRate: \"8%\",\n    termMonths: 36,\n    note: \"Estimated personal loan terms for DTI projection. Actual terms may vary.\"\n  }\n};\n\n\n// ===================\n// STEP 11: DATA CONFIDENCE\n// ===================\n\nlet confidenceLevel, confidenceNote;\n\nif (totalMonths >= 12) {\n  confidenceLevel = \"High\";\n  confidenceNote = \"Meets Non-QM bank statement program standards (12+ months).\";\n} else if (totalMonths >= 6) {\n  confidenceLevel = \"Good\";\n  confidenceNote = `Based on ${totalMonths} months. 12+ months preferred for full confidence per Non-QM standards.`;\n} else if (totalMonths >= 3) {\n  confidenceLevel = \"Moderate\";\n  confidenceNote = `Preliminary assessment based on ${totalMonths} months. Non-QM programs require 12–24 months for production underwriting.`;\n} else {\n  confidenceLevel = \"Low\";\n  confidenceNote = `Only ${totalMonths} month(s) of data. Insufficient for reliable income assessment. Non-QM standards require 12–24 months.`;\n}\n\nconst dataConfidence = {\n  monthsAnalyzed: totalMonths,\n  industryStandard: \"12–24 months (Non-QM bank statement programs)\",\n  confidenceLevel: confidenceLevel,\n  note: confidenceNote\n};\n\n\n// ===================\n// STEP 12: COMPOSITE SCORE\n// ===================\n\n// 12a: Loan-to-income sub-score\nconst loanToIncome = projectedAnnual > 0\n  ? Number(((loanAmount / projectedAnnual) * 100).toFixed(1))\n  : 100;\n\nlet ltiScore;\nif (loanToIncome < 15) ltiScore = 100;\nelse if (loanToIncome < 30) ltiScore = 70;\nelse if (loanToIncome < 50) ltiScore = 40;\nelse ltiScore = 10;\n\n// 12b: Stability sub-score (weighted avg CV across streams)\nlet weightedCV = 0;\nlet totalWeight = 0;\nfor (const name of streamNames) {\n  const share = shares[name] || 0;\n  const cv = incomeStreams[name].stability.cv;\n  weightedCV += cv * share;\n  totalWeight += share;\n}\nif (totalWeight > 0) weightedCV = weightedCV / totalWeight;\n\nlet stabilityScore;\nif (weightedCV < 5) stabilityScore = 100;\nelse if (weightedCV < 15) stabilityScore = 75;\nelse if (weightedCV < 30) stabilityScore = 45;\nelse stabilityScore = 15;\n\n// 12c: Recurrence sub-score\nlet recurrenceScore = 0;\nlet recurrenceCount = 0;\nfor (const name of streamNames) {\n  recurrenceScore += incomeStreams[name].recurrence.rate;\n  recurrenceCount++;\n}\nrecurrenceScore = recurrenceCount > 0\n  ? Math.round((recurrenceScore / recurrenceCount) * 100)\n  : 0;\n\n// 12d: Diversification sub-score\nlet diversificationScore;\nif (hhi < 0.25) diversificationScore = 100;\nelse if (hhi < 0.50) diversificationScore = 60;\nelse diversificationScore = 25;\n\n// 12e: Red flag penalty\nlet redFlagScore = 100;\nfor (const flag of redFlags) {\n  if (flag.severity === \"CRITICAL\") redFlagScore -= 30;\n  else if (flag.severity === \"WARNING\") redFlagScore -= 10;\n  else if (flag.severity === \"INFO\") redFlagScore -= 3;\n}\nredFlagScore = Math.max(0, redFlagScore);\n\n// 12f: DTI sub-score\nlet dtiScore;\nif (dtiWithNewLoan < 36) dtiScore = 100;\nelse if (dtiWithNewLoan < 43) dtiScore = 65;\nelse if (dtiWithNewLoan < 50) dtiScore = 35;\nelse dtiScore = 10;\n\n// 12g: Residual income sub-score\nlet residualScore;\nif (savingsRate > 40) residualScore = 100;\nelse if (savingsRate > 25) residualScore = 80;\nelse if (savingsRate > 10) residualScore = 50;\nelse if (savingsRate > 0) residualScore = 25;\nelse residualScore = 5;\n\n// 12h: Compute weighted composite\nconst compositeScore = Math.round(\n  ltiScore * WEIGHTS.loanToIncome +\n  stabilityScore * WEIGHTS.stability +\n  recurrenceScore * WEIGHTS.recurrence +\n  diversificationScore * WEIGHTS.diversification +\n  redFlagScore * WEIGHTS.redFlags +\n  dtiScore * WEIGHTS.dti +\n  residualScore * WEIGHTS.residualIncome\n);\n\nconst assessmentResult = getAssessment(compositeScore);\n\n\n// ===================\n// STEP 13: UNDERWRITING SUMMARY\n// ===================\n\nconst loanToSustainableIncome = sustainableAnnual > 0\n  ? Number(((loanAmount / sustainableAnnual) * 100).toFixed(1))\n  : 100;\n\nconst incomeMultiple = projectedAnnual > 0\n  ? Number((projectedAnnual / loanAmount).toFixed(2))\n  : 0;\n\nconst underwriting = {\n  loanAmountRequested: loanAmount,\n  loanToIncome: loanToIncome,\n  loanToSustainableIncome: loanToSustainableIncome,\n  incomeMultiple: incomeMultiple,\n  compositeScore: compositeScore,\n  compositeBreakdown: {\n    loanToIncomeScore: ltiScore,\n    stabilityScore: stabilityScore,\n    recurrenceScore: recurrenceScore,\n    diversificationScore: diversificationScore,\n    redFlagScore: redFlagScore,\n    dtiScore: dtiScore,\n    residualIncomeScore: residualScore\n  },\n  compositeWeights: WEIGHTS,\n  assessment: assessmentResult.label,\n  assessmentColor: assessmentResult.color\n};\n\n\n// ===================\n// STEP 14: NARRATIVE\n// ===================\n\nconst streamSummaries = streamNames.map(name => {\n  const s = incomeStreams[name];\n  const label = name.replace(/_/g, ' ').toLowerCase();\n  return `${label} (CV: ${s.stability.cv}%, ${s.stability.label}, floor: $${s.consistency.min.toLocaleString()})`;\n}).join(\"; \");\n\nconst flagSummary = redFlags.length > 0\n  ? ` ${redFlags.length} flag(s) detected: ${redFlags.map(f => f.type.replace(/_/g, ' ').toLowerCase()).join(\", \")}.`\n  : \" No red flags detected.\";\n\nconst expenseSummary = expenses.summary.totalMonthlyBurn > 0\n  ? ` Monthly expenses: $${expenses.summary.totalMonthlyBurn.toLocaleString()} (${(expenses.summary.fixedExpenseRatio * 100).toFixed(0)}% fixed). Residual income: $${meanResidual.toLocaleString()}/month (${savingsRate}% savings rate).`\n  : \"\";\n\nconst dtiSummary = identifiedDebtPayments > 0\n  ? ` Existing debt payments: $${identifiedDebtPayments.toLocaleString()}/month. DTI with new loan: ${dtiWithNewLoan}% — ${dtiGradeResult.grade.toLowerCase()}.`\n  : ` No existing debt payments identified. DTI with new loan: ${dtiWithNewLoan}% — ${dtiGradeResult.grade.toLowerCase()}.`;\n\n// Balance narrative\nlet balanceNarrative = \"\";\nif (balanceBuffer && balanceBuffer.averageBalance !== null) {\n  const rb = balanceBuffer.balanceRunway;\n  const bt = balanceBuffer.balanceTrend;\n  balanceNarrative = ` Account balance: avg $${balanceBuffer.averageBalance.toLocaleString()}, min $${balanceBuffer.minBalance.toLocaleString()}. Balance runway: ${rb.months} months — ${rb.grade.toLowerCase()}. Balance trend: ${bt.label.toLowerCase()} (${bt.changePercent > 0 ? '+' : ''}${bt.changePercent}%).`;\n}\n\nconst narrative = `Borrower shows $${Math.round(projectedAnnual / 1000)}K projected annual income across ${streamNames.length} stream(s) with ${hhiLabel.toLowerCase()} diversification (HHI: ${hhi}). Per-stream analysis: ${streamSummaries}. Overall income stability: ${overallStability.label} (CV: ${overallCV}%).${flagSummary}${expenseSummary}${dtiSummary}${balanceNarrative} Sustainable income (floor-weighted): $${Math.round(sustainableAnnual / 1000)}K (${discountFromProjected}% discount from projected). Loan-to-sustainable-income: ${loanToSustainableIncome}%. Data confidence: ${confidenceLevel} (${totalMonths} months analyzed; industry standard: 12–24). Composite score: ${compositeScore}/100. Assessment: ${assessmentResult.label}.`;\n\n\n// ===================\n// STEP 15: RETURN FINAL OUTPUT\n// ===================\n\nreturn [\n  {\n    json: {\n      incomeStreams: incomeStreams,\n      overall: overall,\n      diversification: diversification,\n      redFlags: redFlags,\n      sustainableIncome: sustainableIncome,\n      expenses: expenses,\n      balanceBuffer: balanceBuffer,\n      cashFlow: cashFlow,\n      debtAnalysis: debtAnalysis,\n      savings: {\n        monthlyInvestment: savingsData.monthlyInvestment || {},\n        meanMonthly: savingsData.meanMonthly || 0\n      },\n      underwriting: underwriting,\n      dataConfidence: dataConfidence,\n      narrative: narrative\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        -48
+      ],
+      "id": "4276f570-6780-4416-bd44-26c6daf01eb9",
+      "name": "analyticsEngine1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// V2 AGGREGATION — Income + Expenses by Category × Month\n// ============================================================\n// Replaces V1 \"Code in JavaScript2\" (income-only aggregation).\n//\n// V1: Aggregated income by category × month, computed mean + projected annual.\n// V2: Does the same for income AND adds full expense aggregation:\n//     - Expenses by category × month\n//     - Expense type breakdown (FIXED / ESSENTIAL / DISCRETIONARY / DEBT)\n//     - Monthly totals for each type\n//     - Savings tracking (INVESTMENT — positive signal)\n//     - Investigate tracking (CASH_WITHDRAWAL, ATM — unclassifiable)\n//\n// INPUT:  Output from checkConfidence node — contains allTransactions\n//         (flat array with _sourceArray field on each transaction)\n//         OR output from filterTransactions node (multiple items with\n//         incomeTransactions, expenseTransactions arrays)\n//\n// OUTPUT: Full aggregation for both sides, ready for V2 analytics engine\n// ============================================================\n\n\n// ===================\n// HELPER: Safe rounding to avoid floating point noise\n// ===================\n// JavaScript floating point: 146.82 + 63.14 = 209.95999999999998\n// This helper ensures all monetary values stay clean.\nfunction r(value) {\n  return Number(value.toFixed(2));\n}\n\n\n// ===================\n// STEP 0: COLLECT ALL TRANSACTIONS — HANDLE BOTH INPUT FORMATS\n// ===================\n// This node can receive input from two sources:\n//   A) checkConfidence node → single item with allTransactions flat array\n//   B) filterTransactions node → multiple items with typed arrays\n//\n// We detect the format and extract accordingly.\n\nconst allIncome = [];\nconst allExpenses = [];\nconst allSavings = [];\nconst allInvestigate = [];\n\nconst items = $input.all();\nconst firstItem = items[0]?.json;\n\nif (firstItem && firstItem.allTransactions) {\n  // -------------------------------------------------------\n  // FORMAT A: checkConfidence output (flat allTransactions array)\n  // Each transaction has _sourceArray telling us where it belongs.\n  // Skip ignored transactions (human marked them for exclusion).\n  // -------------------------------------------------------\n  for (const tx of firstItem.allTransactions) {\n    // Skip transactions that human marked as ignored during HITL review\n    if (tx.ignored) continue;\n\n    switch (tx._sourceArray) {\n      case \"incomeTransactions\":\n        allIncome.push(tx);\n        break;\n      case \"expenseTransactions\":\n        allExpenses.push(tx);\n        break;\n      case \"savingsTransactions\":\n        allSavings.push(tx);\n        break;\n      case \"investigateTransactions\":\n        allInvestigate.push(tx);\n        break;\n      // excludedTransactions — intentionally not collected\n    }\n  }\n} else {\n  // -------------------------------------------------------\n  // FORMAT B: filterTransactions output (multiple items with arrays)\n  // This is the V1-compatible format, kept as fallback.\n  // -------------------------------------------------------\n  for (const item of items) {\n    const data = item.json;\n\n    if (data.incomeTransactions) {\n      allIncome.push(...data.incomeTransactions);\n    }\n    if (data.expenseTransactions) {\n      allExpenses.push(...data.expenseTransactions);\n    }\n    if (data.savingsTransactions) {\n      allSavings.push(...data.savingsTransactions);\n    }\n    if (data.investigateTransactions) {\n      allInvestigate.push(...data.investigateTransactions);\n    }\n  }\n}\n\n\n// ===================\n// STEP 1: AGGREGATE INCOME (same logic as V1)\n// ===================\n// Group by category → month → sum amounts\n// Then compute mean monthly and projected annual per category\n\nconst incomeByCategory = {};\nconst overallMonthlyIncome = {};\n\nfor (const tx of allIncome) {\n  const category = tx.transactionCategory;\n  const month = tx.date.slice(0, 7); // YYYY-MM\n  const amount = Math.abs(tx.amount);\n\n  // Per-category aggregation\n  if (!incomeByCategory[category]) {\n    incomeByCategory[category] = { monthlyIncome: {} };\n  }\n  incomeByCategory[category].monthlyIncome[month] =\n    r((incomeByCategory[category].monthlyIncome[month] || 0) + amount);\n\n  // Overall monthly total\n  overallMonthlyIncome[month] =\n    r((overallMonthlyIncome[month] || 0) + amount);\n}\n\n// Compute mean and projected annual for each income category\nconst incomeCategories = Object.keys(incomeByCategory);\n\nfor (const category of incomeCategories) {\n  const months = Object.keys(incomeByCategory[category].monthlyIncome);\n  const values = Object.values(incomeByCategory[category].monthlyIncome);\n\n  if (months.length === 0) {\n    delete incomeByCategory[category];\n    continue;\n  }\n\n  const total = values.reduce((a, b) => a + b, 0);\n  const mean = total / months.length;\n\n  incomeByCategory[category].meanMonthlyIncome = r(mean);\n  incomeByCategory[category].projectedAnnualIncome = r(mean * 12);\n}\n\n// Overall income statistics\nconst overallIncomeValues = Object.values(overallMonthlyIncome);\nconst overallIncomeTotal = overallIncomeValues.reduce((a, b) => a + b, 0);\nconst overallIncomeMean = overallIncomeValues.length > 0\n  ? overallIncomeTotal / overallIncomeValues.length\n  : 0;\n\nconst OVERALL_INCOME = {\n  monthlyIncome: overallMonthlyIncome,\n  meanMonthlyIncome: r(overallIncomeMean),\n  projectedAnnualIncome: r(overallIncomeMean * 12)\n};\n\n\n// ===================\n// STEP 2: AGGREGATE EXPENSES (NEW in V2)\n// ===================\n// Same pattern as income: group by category → month → sum amounts\n// PLUS: track expense type (FIXED/ESSENTIAL/DISCRETIONARY/DEBT)\n\nconst expenseByCategory = {};\nconst overallMonthlyExpense = {};\n\n// Monthly totals by expense type\nconst monthlyByType = {\n  FIXED: {},\n  ESSENTIAL: {},\n  DISCRETIONARY: {},\n  DEBT: {},\n  INVESTIGATE: {}\n};\n\nfor (const tx of allExpenses) {\n  const category = tx.transactionCategory;\n  const month = tx.date.slice(0, 7); // YYYY-MM\n  const amount = Math.abs(tx.amount);\n  const expenseType = tx.expenseType; // Set by filterTransactions node\n\n  // Per-category aggregation\n  if (!expenseByCategory[category]) {\n    expenseByCategory[category] = {\n      monthlyExpense: {},\n      expenseType: expenseType\n    };\n  }\n  expenseByCategory[category].monthlyExpense[month] =\n    r((expenseByCategory[category].monthlyExpense[month] || 0) + amount);\n\n  // Overall monthly total\n  overallMonthlyExpense[month] =\n    r((overallMonthlyExpense[month] || 0) + amount);\n\n  // Monthly by type\n  if (monthlyByType[expenseType]) {\n    monthlyByType[expenseType][month] =\n      r((monthlyByType[expenseType][month] || 0) + amount);\n  }\n}\n\n// Compute mean monthly for each expense category\nconst expenseCategories = Object.keys(expenseByCategory);\n\nfor (const category of expenseCategories) {\n  const months = Object.keys(expenseByCategory[category].monthlyExpense);\n  const values = Object.values(expenseByCategory[category].monthlyExpense);\n\n  if (months.length === 0) {\n    delete expenseByCategory[category];\n    continue;\n  }\n\n  const total = values.reduce((a, b) => a + b, 0);\n  const mean = total / months.length;\n\n  expenseByCategory[category].meanMonthly = r(mean);\n}\n\n// Overall expense statistics\nconst overallExpenseValues = Object.values(overallMonthlyExpense);\nconst overallExpenseTotal = overallExpenseValues.reduce((a, b) => a + b, 0);\nconst overallExpenseMean = overallExpenseValues.length > 0\n  ? overallExpenseTotal / overallExpenseValues.length\n  : 0;\n\n\n// ===================\n// STEP 3: EXPENSE TYPE SUMMARIES\n// ===================\n// Compute mean monthly for each expense type (FIXED, ESSENTIAL, etc.)\n\nfunction meanOfObject(obj) {\n  const values = Object.values(obj);\n  if (values.length === 0) return 0;\n  return r(values.reduce((a, b) => a + b, 0) / values.length);\n}\n\nconst fixedMonthly = meanOfObject(monthlyByType.FIXED);\nconst essentialMonthly = meanOfObject(monthlyByType.ESSENTIAL);\nconst discretionaryMonthly = meanOfObject(monthlyByType.DISCRETIONARY);\nconst debtMonthly = meanOfObject(monthlyByType.DEBT);\nconst investigateMonthly = meanOfObject(monthlyByType.INVESTIGATE);\n\nconst totalMonthlyBurn = r(overallExpenseMean);\n\n// Fixed expense ratio: what share of total spending is non-negotiable?\n// Fixed = FIXED + DEBT (both are obligations the borrower can't easily reduce)\nconst fixedPlusDebt = r(fixedMonthly + debtMonthly);\nconst fixedExpenseRatio = totalMonthlyBurn > 0\n  ? Number((fixedPlusDebt / totalMonthlyBurn).toFixed(3))\n  : 0;\n\n\n// ===================\n// STEP 4: SAVINGS TRACKING (INVESTMENT)\n// ===================\n// Savings are NOT expenses — they're a positive signal.\n// Track them separately.\n\nconst savingsByMonth = {};\n\nfor (const tx of allSavings) {\n  const month = tx.date.slice(0, 7);\n  const amount = Math.abs(tx.amount);\n  savingsByMonth[month] = r((savingsByMonth[month] || 0) + amount);\n}\n\nconst savingsMean = meanOfObject(savingsByMonth);\n\n\n// ===================\n// STEP 5: BUILD OUTPUT\n// ===================\n\n// Income side (same structure as V1, so V2 analytics engine can read it)\nconst incomeOutput = {};\nfor (const category of Object.keys(incomeByCategory)) {\n  incomeOutput[category] = incomeByCategory[category];\n}\nincomeOutput[\"OVERALL\"] = OVERALL_INCOME;\n\nreturn [\n  {\n    json: {\n      // === INCOME (V1-compatible structure) ===\n      ...incomeOutput,\n\n      // === EXPENSES (NEW in V2) ===\n      expenses: {\n        categories: expenseByCategory,\n        monthlyTotals: overallMonthlyExpense,\n        byType: {\n          FIXED: monthlyByType.FIXED,\n          ESSENTIAL: monthlyByType.ESSENTIAL,\n          DISCRETIONARY: monthlyByType.DISCRETIONARY,\n          DEBT: monthlyByType.DEBT,\n          INVESTIGATE: monthlyByType.INVESTIGATE\n        },\n        summary: {\n          totalMonthlyBurn: totalMonthlyBurn,\n          fixedMonthly: fixedMonthly,\n          essentialMonthly: essentialMonthly,\n          discretionaryMonthly: discretionaryMonthly,\n          debtMonthly: debtMonthly,\n          investigateMonthly: investigateMonthly,\n          fixedExpenseRatio: fixedExpenseRatio\n        }\n      },\n\n      // === SAVINGS (NEW in V2) ===\n      savings: {\n        monthlyInvestment: savingsByMonth,\n        meanMonthly: savingsMean\n      }\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        -48
+      ],
+      "id": "b4fbeffc-674f-4b64-b81d-d774ab87894d",
+      "name": "aggregation1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $json;\nconst streams = Object.keys(d.incomeStreams || {}).length;\nconst assessment = d.underwriting?.assessment || \"REVIEW\";\nconst months = d.dataConfidence?.monthsAnalyzed || 0;\nconst flags = (d.redFlags || []).length;\n\nconst strength = d.cashFlow?.savingsRate > 50 \n  ? \"Strong savings rate with stable recurring income\"\n  : \"Multi-stream income with diversified sources\";\n\nconst concern = months < 6 \n  ? `only ${months} months of data (12-24 recommended)`\n  : flags > 2 \n  ? `${flags} red flags requiring manual verification`\n  : \"limited data history\";\n\nreturn [{\n  json: {\n    ...d,\n    shortNarrative: `${strength}, but ${concern}.`\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        -48
+      ],
+      "id": "a6904b47-dbfb-4575-835b-4778e5c5ef20",
+      "name": "Code in JavaScript2"
+    }
+  ],
+  "pinData": {
+    "Webhook": [
+      {
+        "json": {
+          "headers": {
+            "host": "localhost:5678",
+            "connection": "keep-alive",
+            "content-length": "6652",
+            "sec-ch-ua-platform": "\"macOS\"",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+            "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+            "content-type": "multipart/form-data; boundary=----WebKitFormBoundary6Q229wkk4GykL8Lw",
+            "sec-ch-ua-mobile": "?0",
+            "accept": "*/*",
+            "origin": "http://localhost:8443",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "referer": "http://localhost:8443/",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "accept-language": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "loanAmount": "22000",
+            "email": "a@a.com"
+          },
+          "webhookUrl": "http://localhost:5678/webhook/steadview",
+          "executionMode": "production"
+        },
+        "binary": {
+          "files0": {
+            "mimeType": "application/pdf",
+            "fileType": "pdf",
+            "fileExtension": "pdf",
+            "data": "filesystem-v2",
+            "fileName": "Bank_Statement_May_2026.pdf",
+            "id": "filesystem-v2:workflows/Tz2wnxj8kbRJat5i/executions/193/binary_data/1b548b96-410f-4fe6-8d14-efa7294d743d",
+            "fileSize": "6.24 kB",
+            "bytes": 6244
+          }
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "base64_to_binary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "extrac_and_classify_itIndividualEntries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "filterIncomeStreams": {
+      "main": [
+        [
+          {
+            "node": "CheckLowConfEntries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "structureData": {
+      "main": [
+        [
+          {
+            "node": "filterIncomeStreams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "base64_to_binary": {
+      "main": [
+        [
+          {
+            "node": "filterOutMetadaData",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "classify_bankStatements": {
+      "main": [
+        [
+          {
+            "node": "filter_usefulData",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "returnErrorDetails1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "filter_usefulData": {
+      "main": [
+        [
+          {
+            "node": "merge_classificationOutput_and_binaryDocuments",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "returnErrorDetails1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge_classificationOutput_and_binaryDocuments": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "extrac_and_classify_itIndividualEntries": {
+      "main": [
+        [
+          {
+            "node": "structureData",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "returnErrorDetails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "analyticsEngine": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "aggregation": {
+      "main": [
+        [
+          {
+            "node": "analyticsEngine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CheckLowConfEntries": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "aggregation1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "returnErrorDetails": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "returnErrorDetails1": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "filterOutMetadaData": {
+      "main": [
+        [
+          {
+            "node": "classify_bankStatements",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "merge_classificationOutput_and_binaryDocuments",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "aggregation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "analyticsEngine1": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "aggregation1": {
+      "main": [
+        [
+          {
+            "node": "analyticsEngine1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript2": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "45389afb-ea64-4ca0-93e1-2bd47a60061c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ad151713c881d55d472b5cf03089492af447f0cd09fd11d124d7e004b6b1fb99"
+  },
+  "nodeGroups": [],
+  "id": "Tz2wnxj8kbRJat5i",
+  "tags": []
+}

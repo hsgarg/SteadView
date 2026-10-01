@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+.figma/
+.DS_Store
+*.local
+.mise.toml
+AGENTS.md
+CLAUDE.md
+pnpm-lock.yaml
+src/App\ copy.tsx
+buildathon_gameplan*.md
+*.pdf
