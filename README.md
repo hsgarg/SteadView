@@ -149,7 +149,7 @@ npm run preview   # serves the build locally
 
 Sample bank statements (January to June 2026, PDF) live in the companion repo:
 
-**https://github.com/hsgarg/SteadView-Loan-underwriting-for-gig-workers/tree/main/test-data**
+**https://github.com/hsgarg/SteadView/tree/main/test-data**
 
 Upload all six for the most complete analysis; fewer months lowers the Data Confidence score.
 
